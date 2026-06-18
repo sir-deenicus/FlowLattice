@@ -64,9 +64,9 @@ let terminalCount events =
 
 // ---- building blocks ------------------------------------------------------
 
-let value x = Observable.singleton x
-let ofSeq xs = Observable.ofSeq xs
-let fail<'T> (e: exn) : AsyncObservable<'T> = Observable.fail e
+let value x = AsyncObservable.singleton x
+let ofSeq xs = AsyncObservable.ofSeq xs
+let fail<'T> (e: exn) : AsyncObservable<'T> = AsyncObservable.fail e
 
 /// A unit observable that runs a side effect, then completes.
 let effect (f: unit -> unit) : AsyncObservable<unit> =
@@ -74,6 +74,10 @@ let effect (f: unit -> unit) : AsyncObservable<unit> =
         f ()
         do! obs.OnCompleted()
     }
+
+checkEq "facade: switch alias forwards to switchLatest"
+    [ N 42; C ]
+    (record 100 (AsyncRx.switch (AsyncObservable.singleton (AsyncObservable.singleton 42))))
 
 // ---- P0-1: terminal-safe bind --------------------------------------------
 
@@ -83,11 +87,11 @@ checkEq "bind: single value, one completion"
 
 checkEq "bind: multi-value flatten"
     [ N 1; N 10; N 2; N 20; N 3; N 30; C ]
-    (record 100 (ofSeq [ 1; 2; 3 ] |> Operators.bind (fun x -> ofSeq [ x; x * 10 ])))
+    (record 100 (ofSeq [ 1; 2; 3 ] |> AsyncObservable.bind (fun x -> ofSeq [ x; x * 10 ])))
 
 let innerErr =
     ofSeq [ 1; 2; 3 ]
-    |> Operators.bind (fun x -> if x = 1 then fail (exn "boom") else value x)
+    |> AsyncObservable.bind (fun x -> if x = 1 then fail (exn "boom") else value x)
     |> record 100
 
 checkEq "bind: inner error -> exactly one error, no later values/completion"
@@ -95,13 +99,13 @@ checkEq "bind: inner error -> exactly one error, no later values/completion"
 
 checkEq "bind: outer error -> exactly one error"
     [ E "outer" ]
-    (record 100 ((fail (exn "outer")) |> Operators.bind (fun x -> value x)))
+    (record 100 ((fail (exn "outer")) |> AsyncObservable.bind (fun x -> value x)))
 
 // ---- P0-2: completion-based Combine --------------------------------------
 
 checkEq "combine: empty;value emits second, one completion"
     [ N 5; C ]
-    (record 100 (asyncRx.Combine(Observable.empty, value 5)))
+    (record 100 (asyncRx.Combine(AsyncObservable.empty, value 5)))
 
 let mutable combineSecond = 0
 let combineMultiFirst =
@@ -137,7 +141,7 @@ let mutable emptyIters = 0
 let whileEmptyBody =
     asyncRx.While(
         (fun () -> emptyIters <- emptyIters + 1; emptyIters <= 2),
-        Observable.empty)               // empty-completing body
+        AsyncObservable.empty)               // empty-completing body
 let whileEmptyEvents = record 100 whileEmptyBody
 checkEq "while: empty-completing body still advances" 3 emptyIters
 checkEq "while: empty-body loop completes once" [ C ] whileEmptyEvents
@@ -289,7 +293,7 @@ let secondCompleteThenErr : AsyncObservable<int> =
     }
 checkEq "combine: second completes-then-errors -> value + one completion"
     [ N 7; C ]
-    (record 100 (asyncRx.Combine(Observable.empty, secondCompleteThenErr)))
+    (record 100 (asyncRx.Combine(AsyncObservable.empty, secondCompleteThenErr)))
 
 // `second` throwing (not calling OnError) before/after a value must still surface
 // as exactly one downstream error — the throw is caught and routed through the gate.
@@ -307,11 +311,11 @@ let firstThrows : AsyncObservable<unit> =
 
 checkEq "combine: second throws before terminal -> one error"
     [ E "second-throw" ]
-    (record 100 (asyncRx.Combine(Observable.empty, secondThrowsImmediately)))
+    (record 100 (asyncRx.Combine(AsyncObservable.empty, secondThrowsImmediately)))
 
 checkEq "combine: second emits then throws -> value + one error"
     [ N 7; E "second-after-value" ]
-    (record 100 (asyncRx.Combine(Observable.empty, secondEmitsThenThrows)))
+    (record 100 (asyncRx.Combine(AsyncObservable.empty, secondEmitsThenThrows)))
 
 checkEq "combine: first throws -> one error"
     [ E "first-throw" ]
@@ -385,23 +389,23 @@ check "for: enumerator disposed on body error" bodyErrDisposed.Value
 
 let stopDisposed = ref false
 let stopForEvents =
-    record 50 (asyncRx.For(probeSeq 3 None false stopDisposed, fun _ -> Observable.never))
+    record 50 (asyncRx.For(probeSeq 3 None false stopDisposed, fun _ -> AsyncObservable.never))
 check "for: stop during body -> no terminal" (terminalCount stopForEvents = 0)
 check "for: enumerator disposed on stop" stopDisposed.Value
 
 // ---- P0-4: Stop terminates cleanly (no terminal, no hang) ----------------
 
 check "interval: stop -> no terminal"
-    (terminalCount (record 60 (Observable.intervalMillis 15)) = 0)
+    (terminalCount (record 60 (AsyncObservable.intervalMillis 15)) = 0)
 
 check "bind: stop during active inner -> no terminal"
-    (terminalCount (record 60 (value 0 |> Operators.bind (fun _ -> Observable.intervalMillis 15))) = 0)
+    (terminalCount (record 60 (value 0 |> AsyncObservable.bind (fun _ -> AsyncObservable.intervalMillis 15))) = 0)
 
 check "merge: stop -> no terminal"
-    (terminalCount (record 60 (Merge.merge [ Observable.intervalMillis 15; Observable.intervalMillis 18 ])) = 0)
+    (terminalCount (record 60 (Merge.merge [ AsyncObservable.intervalMillis 15; AsyncObservable.intervalMillis 18 ])) = 0)
 
 check "zip: stop -> no terminal"
-    (terminalCount (record 60 (Operators.zip (Observable.intervalMillis 15) (Observable.intervalMillis 18))) = 0)
+    (terminalCount (record 60 (AsyncObservable.zip (AsyncObservable.intervalMillis 15) (AsyncObservable.intervalMillis 18))) = 0)
 
 // Codex non-blocking follow-up: stopping an active synchronous `ofSeq` must
 // dispose its enumerator, emit no terminal, and fire `Subscription.Completion`.
@@ -416,8 +420,8 @@ let stopOfSeqCompletionFired =
     }
     Hopac.run <| job {
         let source =
-            Observable.ofSeq (probeSeq 1000 None false stopOfSeqDisposed)
-            |> Operators.mapJob pace
+            AsyncObservable.ofSeq (probeSeq 1000 None false stopOfSeqDisposed)
+            |> AsyncObservable.mapJob pace
         let! sub =
             subscribeJob source
                 (fun x -> job { stopOfSeqEvents.Add(N x) })
@@ -446,7 +450,7 @@ checkEq "completion: finite source signals deterministic teardown"
 
 checkEq "completion: empty source completes deterministically"
     [ C ]
-    (recordUntilDone Observable.empty)
+    (recordUntilDone AsyncObservable.empty)
 
 checkEq "completion: error source signals completion after the error"
     [ E "boom" ]
@@ -457,31 +461,31 @@ checkEq "completion: error source signals completion after the error"
 // the enumerator is always disposed.
 checkEq "ofSeq: GetEnumerator failure -> one error"
     [ E "get-enum" ]
-    (recordUntilDone (Observable.ofSeq getEnumeratorThrows))
+    (recordUntilDone (AsyncObservable.ofSeq getEnumeratorThrows))
 
 let ofSeqMnDisposed = ref false
 checkEq "ofSeq: MoveNext failure -> emitted value then one error"
     [ N 1; E "move-next" ]
-    (recordUntilDone (Observable.ofSeq (probeSeq 5 (Some 2) false ofSeqMnDisposed)))
+    (recordUntilDone (AsyncObservable.ofSeq (probeSeq 5 (Some 2) false ofSeqMnDisposed)))
 check "ofSeq: enumerator disposed after MoveNext failure" ofSeqMnDisposed.Value
 
 let ofSeqDpDisposed = ref false
 checkEq "ofSeq: normal-path Dispose failure -> values then one error, no completion"
     [ N 1; N 2; E "dispose" ]
-    (recordUntilDone (Observable.ofSeq (probeSeq 2 None true ofSeqDpDisposed)))
+    (recordUntilDone (AsyncObservable.ofSeq (probeSeq 2 None true ofSeqDpDisposed)))
 check "ofSeq: enumerator disposed (attempted) on Dispose failure" ofSeqDpDisposed.Value
 
 let ofSeqOkDisposed = ref false
 checkEq "ofSeq: normal completion -> values then single completion"
     [ N 1; N 2; N 3; C ]
-    (recordUntilDone (Observable.ofSeq (probeSeq 3 None false ofSeqOkDisposed)))
+    (recordUntilDone (AsyncObservable.ofSeq (probeSeq 3 None false ofSeqOkDisposed)))
 check "ofSeq: enumerator disposed on normal completion" ofSeqOkDisposed.Value
 
 // ofSeq stack-safety: a large synchronous sequence must not overflow the stack
 // (the old `return! loop ()` did, ~75-95k). Driven to its terminal via runJob.
 let mutable ofSeqCount = 0
 let bigOfSeqEvents =
-    recordToEnd (Observable.ofSeq (seq { 1 .. bigN }) |> Operators.map (fun x -> ofSeqCount <- ofSeqCount + 1; x))
+    recordToEnd (AsyncObservable.ofSeq (seq { 1 .. bigN }) |> AsyncObservable.map (fun x -> ofSeqCount <- ofSeqCount + 1; x))
 check "ofSeq: 100k synchronous elements do not overflow the stack"
     (ofSeqCount = bigN && List.last bigOfSeqEvents = C)
 
@@ -494,12 +498,12 @@ open AsyncRxHopac.ClauseCE
 // yield an empty result; `Choice.firstValue` must discard empty-completers so a
 // slower clause that actually produces a value is selected instead.
 let nonMatch : AsyncObservable<string> =
-    value 1 |> Operators.choose (fun (_: int) -> (None: string option))
+    value 1 |> AsyncObservable.choose (fun (_: int) -> (None: string option))
 
 let slowMatch (label: string) (ms: int) : AsyncObservable<string> =
-    Observable.intervalMillis ms
-    |> Operators.map (fun _ -> label)
-    |> Operators.first
+    AsyncObservable.intervalMillis ms
+    |> AsyncObservable.map (fun _ -> label)
+    |> AsyncObservable.first
 
 checkEq "firstValue: empty-completer does not preempt a slower match"
     [ N "b"; C ]

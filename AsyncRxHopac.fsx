@@ -8,9 +8,9 @@
       - Hopac-native cancellation: broadcast cancellation via IVar<unit>.
       - Rx-like operators: map, filter, choose, scan, take, merge, amb, debounce, switchLatest.
       - Combinators by algebraic role: Merge (interleave); Choice (amb/orElse first-to-emit,
-        firstValue clause selection); and the applicative stream product (zip/bothOnce,
-        surfaced as and!) in Operators. The clauses { } DSL selects the first *matching*
-        clause (joinad-style) via Choice.firstValue over Observable.guard.
+        firstValue clause selection); and the ordinary AsyncObservable transforms/products
+        (map/filter/bind/zip/bothOnce). The clauses { } DSL selects the first *matching*
+        clause (joinad-style) via Choice.firstValue over AsyncObservable.guard.
       - Small ergonomic DSL: asyncRx { ... } and clauses { ... }.
 
     Package dependency:
@@ -68,7 +68,7 @@ module Core =
     // `AsyncObservable<'T>` is a public function type, so a hand-written source
     // can violate rule 2 (double terminal, value-after-terminal, throw-after-
     // error). The subscription boundary therefore wraps the observer in
-    // `Internal.terminalGate` as a final defense. Operators that own more than
+    // `Internal.terminalGate` as a final defense. Combinators that own more than
     // one source or cleanup work still apply their own terminal guard — the
     // boundary gate is the last line, not a substitute for correct operator
     // lifecycle.
@@ -194,7 +194,7 @@ module internal Internal =
                     terminated <- true
                     obs.OnCompleted() }
 
-module Observable =
+module AsyncObservable =
 
     let empty<'T> : AsyncObservable<'T> =
         fun ctx obs ->
@@ -314,8 +314,6 @@ module Observable =
                 else
                     do! ctx.Stop
         }
-
-module Operators =
 
     let map (f: 'T -> 'U) (source: AsyncObservable<'T>) : AsyncObservable<'U> =
         fun ctx obs ->
@@ -1046,8 +1044,8 @@ module Choice =
 
     /// Clause selection: subscribe all sources and select the first to emit a
     /// *value* (or to error). Unlike `amb`, a source that completes *without*
-    /// emitting (a non-matching clause built from `Observable.guard` /
-    /// `Operators.choose`) is discarded instead of winning the race, so its
+    /// emitting (a non-matching clause built from `AsyncObservable.guard` /
+    /// `AsyncObservable.choose`) is discarded instead of winning the race, so its
     /// completion cannot beat a slower clause that actually produces a value.
     /// The combined stream completes empty only if *every* source completes
     /// empty. Once a source emits, it wins: the rest are cancelled and the
@@ -1179,18 +1177,16 @@ module Choice =
 
 module AsyncRxCE =
 
-    open Operators
-
     type AsyncRxBuilder() =
 
         member _.Return(x: 'T) : AsyncObservable<'T> =
-            Observable.singleton x
+            AsyncObservable.singleton x
 
         member _.ReturnFrom(source: AsyncObservable<'T>) : AsyncObservable<'T> =
             source
 
         member _.Zero() : AsyncObservable<unit> =
-            Observable.empty
+            AsyncObservable.empty
 
         member _.Delay(f: unit -> AsyncObservable<'T>) : AsyncObservable<'T> =
             fun ctx obs ->
@@ -1202,7 +1198,7 @@ module AsyncRxCE =
                 f: 'T -> AsyncObservable<'U>
             ) : AsyncObservable<'U> =
 
-            Operators.bind f source
+            AsyncObservable.bind f source
 
         // Statement sequencing: ignore the values of `first`, and start `second`
         // exactly once when `first` completes normally (never after an error).
@@ -1365,7 +1361,7 @@ module AsyncRxCE =
                 right: AsyncObservable<'U>
             ) : AsyncObservable<'T * 'U> =
 
-            zip left right
+            AsyncObservable.zip left right
 
         member _.BindReturn
             (
@@ -1373,7 +1369,7 @@ module AsyncRxCE =
                 f: 'T -> 'U
             ) : AsyncObservable<'U> =
 
-            Operators.map f source
+            AsyncObservable.map f source
 
         member _.Run(source: AsyncObservable<'T>) : AsyncObservable<'T> =
             source
@@ -1401,7 +1397,7 @@ module ClauseCE =
             f ()
 
         /// Selects the first clause to emit a *value*. A non-matching clause
-        /// (built with `Observable.guard` / `Operators.choose`) completes without
+        /// (built with `AsyncObservable.guard` / `AsyncObservable.choose`) completes without
         /// emitting; `Choice.firstValue` discards such empty-completers rather
         /// than letting their completion win the race (which plain `amb` would),
         /// so a slower clause that actually matches still gets selected.
@@ -1599,53 +1595,55 @@ module TaskInterop =
 
 module AsyncRx =
 
-    open Operators
     open AsyncRxCE
 
     let asyncRx =
         AsyncRxCE.asyncRx
 
     let value x =
-        Observable.singleton x
+        AsyncObservable.singleton x
 
     let empty<'T> =
-        Observable.empty<'T>
+        AsyncObservable.empty<'T>
 
     let never<'T> =
-        Observable.never<'T>
+        AsyncObservable.never<'T>
 
     let fail<'T> e =
-        Observable.fail<'T> e
+        AsyncObservable.fail<'T> e
 
     let ofSeq xs =
-        Observable.ofSeq xs
+        AsyncObservable.ofSeq xs
 
     let interval ms =
-        Observable.intervalMillis ms
+        AsyncObservable.intervalMillis ms
 
     let map f xs =
-        Operators.map f xs
+        AsyncObservable.map f xs
 
     let mapJob f xs =
-        Operators.mapJob f xs
+        AsyncObservable.mapJob f xs
 
     let filter f xs =
-        Operators.filter f xs
+        AsyncObservable.filter f xs
 
     let choose f xs =
-        Operators.choose f xs
+        AsyncObservable.choose f xs
 
     let take n xs =
-        Operators.take n xs
+        AsyncObservable.take n xs
 
     let scan f init xs =
-        Operators.scan f init xs
+        AsyncObservable.scan f init xs
 
     let debounce ms xs =
-        Operators.debounce ms xs
+        AsyncObservable.debounce ms xs
 
     let switchLatest xs =
-        Operators.switchLatest xs
+        AsyncObservable.switchLatest xs
+
+    let switch xs =
+        AsyncObservable.switchLatest xs
 
     let merge xs =
         Merge.merge xs
@@ -1657,22 +1655,22 @@ module AsyncRx =
         Choice.amb xs
 
     let zip a b =
-        Operators.zip a b
+        AsyncObservable.zip a b
 
     let bothOnce a b =
-        Operators.bothOnce a b
+        AsyncObservable.bothOnce a b
 
     let orElse a b =
         Choice.orElse a b
 
     let case source chooser =
-        Operators.choose chooser source
+        AsyncObservable.choose chooser source
 
     let first source =
-        Operators.first source
+        AsyncObservable.first source
 
     let firstWhere pred source =
-        Operators.firstWhere pred source
+        AsyncObservable.firstWhere pred source
 
 module Examples =
 

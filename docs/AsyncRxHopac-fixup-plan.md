@@ -10,22 +10,26 @@ consistency, and naming.
 P0, P1, and P2 are signed off (see "Review sign-off" below), Codex's one
 non-blocking follow-up (the `ofSeq` Stop-path regression) is in, and the
 post-P2 polish batch (clause-selection fix, `AsyncRx` rename, synonym prune,
-do-notation sample, `Applicative`→`Operators` fold) is done. The expanded
-suite (`../AsyncRxHopac.Tests.fsx`, **70 checks**) passes and exits 0. See
-"P2 implementation — 2026-06-15" and "Post-P2 polish batch — 2026-06-17".
+do-notation sample, `Applicative`→`Operators` fold) is done. The follow-up
+module cleanup folds `Operators` into `AsyncObservable`, removes the ambiguous
+`Observable` module name, and keeps the `AsyncRx.switch` facade alias. The expanded suite
+(`../AsyncRxHopac.Tests.fsx`, **71 checks**) passes and exits 0. See
+"P2 implementation — 2026-06-15", "Post-P2 polish batch — 2026-06-17", and the
+latest 2026-06-18 sign-off below.
 
 | Item | Status |
 |------|--------|
 | P0-1 terminal-safe `bind` | ✅ done; active-inner Stop regression added |
 | P0-2 completion-based `Combine` | ✅ done; `second`-throw now routed through the gate; regressions added |
 | P0-3 stack-safe, completion-based `While` | ✅ done |
-| P0-4 regression harness | ✅ done; expanded suite now has 70 checks incl. `second`-throw, malformed-source, `For`/`ofSeq` lifecycle, Stop, clause selection |
+| P0-4 regression harness | ✅ done; expanded suite now has 71 checks incl. `second`-throw, malformed-source, `For`/`ofSeq` lifecycle, Stop, clause selection, facade alias coverage |
 | P0-5 observable source contract | ✅ done; documented + reusable `Internal.terminalGate` at the boundary |
 | P1-1 Task cancellation-bridge lifetime | ✅ done; race Stop vs completion; no detached stop watcher |
 | P1-2 remove core `CancellationTokenSource` | ✅ done; Hopac pinned to `0.5.1` |
 | P1-3 lazy / stack-safe `For` | ✅ done; enumerator acquired in-scope, disposed-before-complete, failures → one error |
 | P2 polish | ✅ done; all 9 items addressed — see "P2 implementation — 2026-06-15" |
 | Post-P2 polish batch | ✅ done; clause-selection fix, `AsyncRx` rename, synonym prune, sample, `Applicative`→`Operators` fold (70 checks) — see "Post-P2 polish batch — 2026-06-17" |
+| Module naming cleanup | ✅ done; `Observable` + `Operators` folded into canonical `AsyncObservable` module (71 checks) |
 
 Verify the current baseline with:
 `dotnet fsi AsyncRxHopac.Tests.fsx` (exits non-zero on any recorded failure).
@@ -59,8 +63,8 @@ for the as-built record. Kept here for the decision trail.
    defined once in `AsyncRxCE.asyncRx`; the facade surfaces it.
 3. **Prune redundant synonyms from core modules**, keeping friendly names only in
    the `AsyncRx` facade. Rule: *core = one canonical name per op; facade = the
-   friendly surface.* Remove `Observable.value` (≡ `singleton`), `Choice.race`
-   (≡ `amb`), `Operators.switch` (≡ `switchLatest`) from core; keep
+   friendly surface.* Remove `AsyncObservable.value` (≡ `singleton`), `Choice.race`
+   (≡ `amb`), `AsyncObservable.switch` (≡ `switchLatest`) from core; keep
    `AsyncRx.value`/`race`/`switch`.
 4. **Add an `asyncRx { }` do-notation sample** to `Examples` exercising the
    builder surface the current samples skip: `let!` bind chains, `do!`, `for`,
@@ -76,7 +80,7 @@ operations. **Resolved: fold `zip`/`bothOnce` into `Operators`** (they are strea
 operators, sit beside `map`/`switchLatest`/`debounce`, "an AsyncRx operator" is
 then unambiguous, and the tiny module disappears). The `Applicative` module is
 deleted; `AsyncRxCE.MergeSources` and the `AsyncRx` facade now reference
-`Operators.zip`/`Operators.bothOnce`.
+`AsyncObservable.zip`/`AsyncObservable.bothOnce`.
 
 ### Resolved — "Joinad view" module: skip it
 
@@ -112,8 +116,8 @@ Suite: 63 → **70 checks**, all passing, exit 0.
   uses `asyncRx { }`; the `MergeSources` doc example updated to `asyncRx`.
 
 ### Core synonym prune (canonical in core, friendly in facade)
-- Removed `Observable.value` (≡ `singleton`), `Choice.race` (≡ `amb`),
-  `Operators.switch` (≡ `switchLatest`). The friendly names survive only on the
+- Removed `AsyncObservable.value` (≡ `singleton`), `Choice.race` (≡ `amb`),
+  `AsyncObservable.switch` (≡ `switchLatest`). The friendly names survive only on the
   `AsyncRx` facade (`value`/`race`/`switch`… ). No internal callers existed.
 
 ### `asyncRx { }` do-notation sample
@@ -125,30 +129,46 @@ Suite: 63 → **70 checks**, all passing, exit 0.
 - The `Applicative` module is deleted. `zip` (+ its private `ZipMsg`) and
   `bothOnce` moved verbatim into `Operators` (beside `first`/`firstWhere`).
   `AsyncRxCE.MergeSources` (`open Operators`) and the `AsyncRx` facade reference
-  `Operators.zip`/`Operators.bothOnce`; the test's Stop-path zip check uses
-  `Operators.zip`.
+  `AsyncObservable.zip`/`AsyncObservable.bothOnce`; the test's Stop-path zip check uses
+  `AsyncObservable.zip`.
 
-### Latest review sign-off — 2026-06-17
+### `Observable` / `Operators` → `AsyncObservable` fold — 2026-06-18
+- Supersedes the intermediate `Operators` module: ordinary source constructors
+  (`empty`, `singleton`, `fail`, `never`, `ofSeq`, `intervalMillis`, `guard`) and
+  one-stream/product combinators (`map`, `mapJob`, `filter`, `choose`, `bind`,
+  `take`, `scan`, `debounce`, `switchLatest`, `first`, `firstWhere`, `zip`,
+  `bothOnce`) now live together under `AsyncObservable`.
+- The old `Observable` module name was too easy to confuse with classic
+  `System.IObservable` / Rx naming. The module now shares the precise
+  `AsyncObservable` name with the public function type, which F# supports and
+  which makes call sites such as `AsyncObservable.map` read as operations on
+  this exact abstraction.
+- `Merge` and `Choice` intentionally remain separate: their names encode
+  concurrency/selection policy (`merge`, `amb`, `firstValue`) rather than ordinary
+  stream transformation.
+
+### Latest review sign-off — 2026-06-18
 
 Codex reviewed the current post-P2 polish state and grants implementation
 approval for the latest behavioral surface. Verification:
 
-- `dotnet fsi AsyncRxHopac.Tests.fsx` passes all **70 checks** and exits 0.
+- `dotnet fsi AsyncRxHopac.Tests.fsx` passes all **71 checks** and exits 0.
 - `dotnet fsi --use:AsyncRxHopac.fsx --exec` type-checks successfully.
 
 Review notes:
 
-- **Non-blocking API polish:** the plan says the friendly `switch` alias survives
-  on the `AsyncRx` facade after pruning `Operators.switch`, but the facade
-  currently exposes only `switchLatest`. Either add `AsyncRx.switch =
-  Operators.switchLatest` or update the plan if dropping the alias is intentional.
+- **Module naming cleanup addressed:** `Operators` is folded into
+  `AsyncObservable`, and the ambiguous `Observable` module name is gone.
+- **API polish addressed:** the friendly `AsyncRx.switch` alias now survives on
+  the facade after pruning `AsyncObservable.switch`, with a small regression check
+  covering the alias.
 - **Documentation hygiene:** the older "Review sign-off" section below is a
   historical 2026-06-15 sign-off for the 60-check P0/P1/P2 state. This
-  2026-06-17 section is the current sign-off for the 70-check post-P2 polish
+  2026-06-18 section is the current sign-off for the 71-check post-P2 polish
   state.
 
 Signed: Codex  
-Date: 2026-06-17
+Date: 2026-06-18
 
 ## P2 implementation — 2026-06-15
 
@@ -225,7 +245,7 @@ module matching its algebraic role:
 - `first` / `firstWhere` → **`Operators`** (query).
 - Dropped as redundant: `chooseFirst`, `matchAny` (≡ `amb`), `both` (≡ `zip`),
   `caseOf` (≡ `choose`), `clause` (≡ `id`). `clauses { }` now calls `Choice.amb`
-  directly; `Rx.case` calls `Operators.choose`.
+  directly; `Rx.case` calls `AsyncObservable.choose`.
 
 Behavior is unchanged (suite still 60/60); this is purely structural. The three
 binary stream combinators now read by role: `Merge` (interleave), `Choice`
@@ -377,8 +397,8 @@ exit 0.
 
 ### Notes / deviations
 
-- The earlier `For` stack-safety probe used `Observable.intervalMillis` as a
-  unit body; the Stop test instead uses `Observable.never` (a unit-typed source
+- The earlier `For` stack-safety probe used `AsyncObservable.intervalMillis` as a
+  unit body; the Stop test instead uses `AsyncObservable.never` (a unit-typed source
   that suspends until Stop), since `For` requires `AsyncObservable<unit>` bodies.
 - Operator-local guards are kept in `Combine` and `For` per the review's
   guidance: the boundary gate is the last line of defense, not a replacement for
@@ -475,7 +495,7 @@ The original compilation-error classes are fixed and the file type-checks:
 
 ## P0-1 - Make `bind` terminal-safe
 
-**Problem.** `Operators.bind` gives each inner observable the downstream observer
+**Problem.** `AsyncObservable.bind` gives each inner observable the downstream observer
 directly. Every inner completion therefore completes the downstream stream.
 For a multi-value outer source this produces values after completion and multiple
 `OnCompleted` calls.
@@ -591,7 +611,7 @@ member this.While
         if guard () then
             this.Combine(body, this.Delay(loop))
         else
-            Observable.empty
+            AsyncObservable.empty
 
     this.Delay(loop)
 ```
