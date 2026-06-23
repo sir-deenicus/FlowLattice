@@ -9,8 +9,9 @@
       - Rx-like operators: map, filter, choose, scan, take, merge, amb, debounce, switchLatest.
       - Combinators by algebraic role: Merge (interleave); Choice (amb/orElse first-to-emit,
         firstValue clause selection); and the ordinary AsyncObservable transforms/products
-        (map/filter/bind/zip/bothOnce). The clauses { } DSL selects the first *matching*
-        clause (joinad-style) via Choice.firstValue over AsyncObservable.guard.
+        (map/filter/bind/zip/bothOnce). The clauses { } DSL exposes case/whenValue/
+        guardOn/always clause heads and selects the first *matching* value via
+        Choice.firstValue.
       - Small ergonomic DSL: asyncRx { ... } and clauses { ... }.
 
     Package dependency:
@@ -162,6 +163,34 @@ module internal Internal =
             <|>
             (Ch.take ch ^-> fun x -> Choice1Of2 x)
 
+    /// Subscribe `source` on its own job, forwarding each notification into an
+    /// operator mailbox. A thrown source is routed through the same error path as
+    /// `OnError`, matching the per-operator terminal funnel.
+    let forwardInto
+        (ctx: SubscribeContext)
+        (source: AsyncObservable<'T>)
+        (onNext: 'T -> 'Msg)
+        (onError: exn -> 'Msg)
+        (onCompleted: 'Msg)
+        (send: 'Msg -> Job<unit>)
+        : Job<unit> =
+
+        Job.start <| job {
+            try
+                do! source ctx {
+                    OnNext = fun x ->
+                        send (onNext x)
+
+                    OnError = fun e ->
+                        send (onError e)
+
+                    OnCompleted = fun () ->
+                        send onCompleted
+                }
+            with e ->
+                do! send (onError e)
+        }
+
     let cancelMany (tokens: Cancel.Token list) : Job<unit> =
         job {
             for token in tokens do
@@ -195,6 +224,15 @@ module internal Internal =
                     obs.OnCompleted() }
 
 module AsyncObservable =
+
+    let private relayNext
+        (onNext: 'T -> Job<unit>)
+        (obs: AsyncObserver<'U>)
+        : AsyncObserver<'T> =
+
+        { OnNext = onNext
+          OnError = obs.OnError
+          OnCompleted = obs.OnCompleted }
 
     let empty<'T> : AsyncObservable<'T> =
         fun ctx obs ->
@@ -317,14 +355,10 @@ module AsyncObservable =
 
     let map (f: 'T -> 'U) (source: AsyncObservable<'T>) : AsyncObservable<'U> =
         fun ctx obs ->
-            source ctx {
-                OnNext = fun x ->
-                    obs.OnNext (f x)
+            let onNext x =
+                obs.OnNext (f x)
 
-                OnError = obs.OnError
-
-                OnCompleted = obs.OnCompleted
-            }
+            source ctx (relayNext onNext obs)
 
     // Stop-check policy (P2-3): synchronous transforms (`map`, `filter`,
     // `choose`, `scan`) carry no Stop checks — they have no suspension point, so
@@ -336,8 +370,8 @@ module AsyncObservable =
     // synchronous hand-offs. (Stop suppresses work; terminal gating is separate.)
     let mapJob (f: 'T -> Job<'U>) (source: AsyncObservable<'T>) : AsyncObservable<'U> =
         fun ctx obs ->
-            source ctx {
-                OnNext = fun x -> job {
+            let onNext x =
+                job {
                     if not (ctx.IsStopped()) then
                         let! y = f x
 
@@ -345,35 +379,24 @@ module AsyncObservable =
                             do! obs.OnNext y
                 }
 
-                OnError = obs.OnError
-
-                OnCompleted = obs.OnCompleted
-            }
+            source ctx (relayNext onNext obs)
 
     let filter (predicate: 'T -> bool) (source: AsyncObservable<'T>) : AsyncObservable<'T> =
         fun ctx obs ->
-            source ctx {
-                OnNext = fun x ->
-                    if predicate x then obs.OnNext x
-                    else Job.unit ()
+            let onNext x =
+                if predicate x then obs.OnNext x
+                else Job.unit ()
 
-                OnError = obs.OnError
-
-                OnCompleted = obs.OnCompleted
-            }
+            source ctx (relayNext onNext obs)
 
     let choose (chooser: 'T -> 'U option) (source: AsyncObservable<'T>) : AsyncObservable<'U> =
         fun ctx obs ->
-            source ctx {
-                OnNext = fun x ->
-                    match chooser x with
-                    | Some y -> obs.OnNext y
-                    | None -> Job.unit ()
+            let onNext x =
+                match chooser x with
+                | Some y -> obs.OnNext y
+                | None -> Job.unit ()
 
-                OnError = obs.OnError
-
-                OnCompleted = obs.OnCompleted
-            }
+            source ctx (relayNext onNext obs)
 
     let bind (f: 'T -> AsyncObservable<'U>) (source: AsyncObservable<'T>) : AsyncObservable<'U> =
         fun ctx obs -> job {
@@ -468,17 +491,13 @@ module AsyncObservable =
 
         fun ctx obs -> job {
             let mutable state = initial
-
-            do! source ctx {
-                OnNext = fun x -> job {
+            let onNext x =
+                job {
                     state <- folder state x
                     do! obs.OnNext state
                 }
 
-                OnError = obs.OnError
-
-                OnCompleted = obs.OnCompleted
-            }
+            do! source ctx (relayNext onNext obs)
         }
 
     type private SwitchMsg<'T> =
@@ -504,21 +523,13 @@ module AsyncObservable =
                 Internal.giveOrStop operatorCtx events msg
 
             do!
-                Job.start <| job {
-                    try
-                        do! source operatorCtx {
-                            OnNext = fun inner ->
-                                send (OuterNext inner)
-
-                            OnError = fun e ->
-                                send (OuterError e)
-
-                            OnCompleted = fun () ->
-                                send OuterCompleted
-                        }
-                    with e ->
-                        do! send (OuterError e)
-                }
+                Internal.forwardInto
+                    operatorCtx
+                    source
+                    OuterNext
+                    OuterError
+                    OuterCompleted
+                    send
 
             let startInner generation (inner: AsyncObservable<'T>) =
                 job {
@@ -526,21 +537,13 @@ module AsyncObservable =
                         Cancel.childContext operatorCtx
 
                     do!
-                        Job.start <| job {
-                            try
-                                do! inner innerCtx {
-                                    OnNext = fun x ->
-                                        send (InnerNext (generation, x))
-
-                                    OnError = fun e ->
-                                        send (InnerError (generation, e))
-
-                                    OnCompleted = fun () ->
-                                        send (InnerCompleted generation)
-                                }
-                            with e ->
-                                do! send (InnerError (generation, e))
-                        }
+                        Internal.forwardInto
+                            innerCtx
+                            inner
+                            (fun x -> InnerNext (generation, x))
+                            (fun e -> InnerError (generation, e))
+                            (InnerCompleted generation)
+                            send
 
                     return innerCancel
                 }
@@ -637,21 +640,13 @@ module AsyncObservable =
                     Internal.giveOrStop innerCtx inbox msg
 
                 do!
-                    Job.start <| job {
-                        try
-                            do! source innerCtx {
-                                OnNext = fun x ->
-                                    send (Next x)
-
-                                OnError = fun e ->
-                                    send (Error e)
-
-                                OnCompleted = fun () ->
-                                    send Completed
-                            }
-                        with e ->
-                            do! send (Error e)
-                    }
+                    Internal.forwardInto
+                        innerCtx
+                        source
+                        Next
+                        Error
+                        Completed
+                        send
 
                 let rec loop pending =
                     job {
@@ -771,38 +766,22 @@ module AsyncObservable =
                 Internal.giveOrStop innerCtx inbox msg
 
             do!
-                Job.start <| job {
-                    try
-                        do! left innerCtx {
-                            OnNext = fun x ->
-                                send (LeftNext x)
-
-                            OnError = fun e ->
-                                send (LeftError e)
-
-                            OnCompleted = fun () ->
-                                send LeftCompleted
-                        }
-                    with e ->
-                        do! send (LeftError e)
-                }
+                Internal.forwardInto
+                    innerCtx
+                    left
+                    LeftNext
+                    LeftError
+                    LeftCompleted
+                    send
 
             do!
-                Job.start <| job {
-                    try
-                        do! right innerCtx {
-                            OnNext = fun y ->
-                                send (RightNext y)
-
-                            OnError = fun e ->
-                                send (RightError e)
-
-                            OnCompleted = fun () ->
-                                send RightCompleted
-                        }
-                    with e ->
-                        do! send (RightError e)
-                }
+                Internal.forwardInto
+                    innerCtx
+                    right
+                    RightNext
+                    RightError
+                    RightCompleted
+                    send
 
             let rec emitAvailable leftDone rightDone =
                 job {
@@ -879,25 +858,15 @@ module Merge =
                 let send msg =
                     Internal.giveOrStop innerCtx out msg
 
-                let startSource (source: AsyncObservable<'T>) =
-                    Job.start <| job {
-                        try
-                            do! source innerCtx {
-                                OnNext = fun x ->
-                                    send (Next x)
-
-                                OnError = fun e ->
-                                    send (Error e)
-
-                                OnCompleted = fun () ->
-                                    send Completed
-                            }
-                        with e ->
-                            do! send (Error e)
-                    }
-
                 for source in sources do
-                    do! startSource source
+                    do!
+                        Internal.forwardInto
+                            innerCtx
+                            source
+                            Next
+                            Error
+                            Completed
+                            send
 
                 let rec loop remaining =
                     job {
@@ -931,6 +900,42 @@ module Merge =
 
 module Choice =
 
+    type private SourceEntry<'T> =
+        { Cancel : Cancel.Token
+          Ctx : SubscribeContext
+          Ch : Ch<Notification<'T>>
+          Source : AsyncObservable<'T> }
+
+    let private sourceEntry outerCtx source =
+        let childCancel, childCtx =
+            Cancel.childContext outerCtx
+
+        { Cancel = childCancel
+          Ctx = childCtx
+          Ch = Ch<Notification<'T>>()
+          Source = source }
+
+    let private startEntry entry =
+        Internal.forwardInto
+            entry.Ctx
+            entry.Source
+            Next
+            Error
+            Completed
+            (Internal.giveOrStop entry.Ctx entry.Ch)
+
+    let private cancelEntries entries =
+        entries
+        |> List.map (fun entry -> entry.Cancel)
+        |> Internal.cancelMany
+
+    let private cancelEntriesExcept winnerIndex entries =
+        entries
+        |> List.indexed
+        |> List.choose (fun (i, entry) ->
+            if i = winnerIndex then None else Some entry.Cancel)
+        |> Internal.cancelMany
+
     /// Rx-style amb/race:
     /// all sources are subscribed, the first source to produce any notification wins,
     /// and losing sources are cancelled.
@@ -943,40 +948,15 @@ module Choice =
             | _ ->
                 let entries =
                     sources
-                    |> List.map (fun source ->
-                        let childCancel, childCtx =
-                            Cancel.childContext outerCtx
+                    |> List.map (sourceEntry outerCtx)
 
-                        let ch =
-                            Ch<Notification<'T>>()
-
-                        childCancel, childCtx, ch, source)
-
-                let send childCtx ch msg =
-                    Internal.giveOrStop childCtx ch msg
-
-                for _, childCtx, ch, source in entries do
-                    do!
-                        Job.start <| job {
-                            try
-                                do! source childCtx {
-                                    OnNext = fun x ->
-                                        send childCtx ch (Next x)
-
-                                    OnError = fun e ->
-                                        send childCtx ch (Error e)
-
-                                    OnCompleted = fun () ->
-                                        send childCtx ch Completed
-                                }
-                            with e ->
-                                do! send childCtx ch (Error e)
-                        }
+                for entry in entries do
+                    do! startEntry entry
 
                 let indexedTakes =
                     entries
-                    |> List.mapi (fun i (_, _, ch, _) ->
-                        Ch.take ch ^-> fun msg -> i, msg)
+                    |> List.mapi (fun i entry ->
+                        Ch.take entry.Ch ^-> fun msg -> i, msg)
 
                 let! first =
                     (outerCtx.Stop ^-> fun () -> Choice2Of2 ())
@@ -985,22 +965,12 @@ module Choice =
 
                 match first with
                 | Choice2Of2 () ->
-                    let cancels =
-                        entries
-                        |> List.map (fun (cancel, _, _, _) -> cancel)
-
-                    do! Internal.cancelMany cancels
+                    do! cancelEntries entries
 
                 | Choice1Of2 (winnerIndex, firstMsg) ->
-                    let loserCancels =
-                        entries
-                        |> List.indexed
-                        |> List.choose (fun (i, (cancel, _, _, _)) ->
-                            if i = winnerIndex then None else Some cancel)
+                    do! cancelEntriesExcept winnerIndex entries
 
-                    do! Internal.cancelMany loserCancels
-
-                    let winnerCancel, _, winnerCh, _ =
+                    let winner =
                         entries.[winnerIndex]
 
                     let rec forward msg =
@@ -1012,21 +982,21 @@ module Choice =
                                 let! next =
                                     (outerCtx.Stop ^-> fun () -> Choice2Of2 ())
                                     <|>
-                                    (Ch.take winnerCh ^-> fun x -> Choice1Of2 x)
+                                    (Ch.take winner.Ch ^-> fun x -> Choice1Of2 x)
 
                                 match next with
                                 | Choice2Of2 () ->
-                                    do! Cancel.cancel winnerCancel
+                                    do! Cancel.cancel winner.Cancel
 
                                 | Choice1Of2 msg' ->
                                     return! forward msg'
 
                             | Error e ->
-                                do! Cancel.cancel winnerCancel
+                                do! Cancel.cancel winner.Cancel
                                 do! obs.OnError e
 
                             | Completed ->
-                                do! Cancel.cancel winnerCancel
+                                do! Cancel.cancel winner.Cancel
                                 do! obs.OnCompleted()
                         }
 
@@ -1059,55 +1029,22 @@ module Choice =
             | _ ->
                 let entries =
                     sources
-                    |> List.map (fun source ->
-                        let childCancel, childCtx =
-                            Cancel.childContext outerCtx
+                    |> List.map (sourceEntry outerCtx)
 
-                        let ch =
-                            Ch<Notification<'T>>()
-
-                        childCancel, childCtx, ch, source)
-
-                let send childCtx ch msg =
-                    Internal.giveOrStop childCtx ch msg
-
-                for _, childCtx, ch, source in entries do
-                    do!
-                        Job.start <| job {
-                            try
-                                do! source childCtx {
-                                    OnNext = fun x ->
-                                        send childCtx ch (Next x)
-
-                                    OnError = fun e ->
-                                        send childCtx ch (Error e)
-
-                                    OnCompleted = fun () ->
-                                        send childCtx ch Completed
-                                }
-                            with e ->
-                                do! send childCtx ch (Error e)
-                        }
+                for entry in entries do
+                    do! startEntry entry
 
                 let cancelOf i =
-                    let cancel, _, _, _ = entries.[i]
-                    cancel
+                    entries.[i].Cancel
 
                 let channelOf i =
-                    let _, _, ch, _ = entries.[i]
-                    ch
+                    entries.[i].Ch
 
                 let cancelAll () =
-                    entries
-                    |> List.map (fun (cancel, _, _, _) -> cancel)
-                    |> Internal.cancelMany
+                    cancelEntries entries
 
                 let cancelExcept winnerIndex =
-                    entries
-                    |> List.indexed
-                    |> List.choose (fun (i, (cancel, _, _, _)) ->
-                        if i = winnerIndex then None else Some cancel)
-                    |> Internal.cancelMany
+                    cancelEntriesExcept winnerIndex entries
 
                 // Forward the winner's remaining stream after its first value.
                 let rec forward winnerIndex =
@@ -1384,17 +1321,64 @@ module ClauseCE =
         member _.Yield(x: AsyncObservable<'T>) =
             [ x ]
 
+        member _.Yield(_: unit) : AsyncObservable<'T> list =
+            []
+
         member _.YieldFrom(xs: AsyncObservable<'T> list) =
             xs
 
-        member _.Zero() =
+        member _.Zero() : AsyncObservable<'T> list =
             []
 
-        member _.Combine(xs, ys) =
+        member _.Combine(xs: AsyncObservable<'T> list, ys: AsyncObservable<'T> list) =
             xs @ ys
 
         member _.Delay(f: unit -> AsyncObservable<'T> list) =
             f ()
+
+        /// General chooser-based clause. A `None` completes this clause empty,
+        /// so it cannot win unless it produces a value before another clause does.
+        [<CustomOperation("case")>]
+        member _.Case
+            (
+                state: AsyncObservable<'T> list,
+                source: AsyncObservable<'U>,
+                chooser: 'U -> 'T option
+            ) =
+            state @ [ AsyncObservable.choose chooser source ]
+
+        /// Match when `source` emits a value satisfying `predicate`, then return
+        /// the supplied result as this clause's value.
+        [<CustomOperation("whenValue")>]
+        member _.WhenValue
+            (
+                state: AsyncObservable<'U> list,
+                source: AsyncObservable<'T>,
+                predicate: 'T -> bool,
+                result: 'U
+            ) =
+            state @ [ source |> AsyncObservable.filter predicate |> AsyncObservable.map (fun _ -> result) ]
+
+        /// Add a boolean guard clause. A false guard completes empty and is
+        /// ignored by `Choice.firstValue`.
+        [<CustomOperation("guardOn")>]
+        member _.GuardOn
+            (
+                state: AsyncObservable<'T> list,
+                condition: bool,
+                result: 'T
+            ) =
+            state @ [ AsyncObservable.guard condition |> AsyncObservable.map (fun () -> result) ]
+
+        /// Add an unguarded clause. This is not ordered fallback semantics; it
+        /// participates in the same first-value race as every other clause.
+        [<CustomOperation("always")>]
+        member _.Always
+            (
+                state: AsyncObservable<'T> list,
+                source: AsyncObservable<'T>
+            ) =
+            state @ [ source ]
 
         /// Selects the first clause to emit a *value*. A non-matching clause
         /// (built with `AsyncObservable.guard` / `AsyncObservable.choose`) completes without
@@ -1671,5 +1655,3 @@ module AsyncRx =
 
     let firstWhere pred source =
         AsyncObservable.firstWhere pred source
-
-

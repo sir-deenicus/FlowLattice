@@ -536,6 +536,32 @@ checkEq "clauses: matching value selected then completes"
         yield slowMatch "b" 300
     }))
 
+checkEq "clauses: whenValue skips non-matches and selects first matching value"
+    [ N "b was true"; C ]
+    (record 200 (clauses {
+        whenValue (value false) ((=) true) "a was true"
+        whenValue (value true) ((=) true) "b was true"
+    }))
+
+checkEq "clauses: case custom operation keeps chooser semantics"
+    [ N "tick:7"; C ]
+    (record 200 (clauses {
+        case (value 7) (fun n -> if n > 0 then Some (sprintf "tick:%d" n) else None)
+    }))
+
+checkEq "clauses: guardOn false completes empty and does not preempt always"
+    [ N "unguarded"; C ]
+    (record 200 (clauses {
+        guardOn false "guard"
+        always (slowMatch "unguarded" 20)
+    }))
+
+checkEq "clauses: yield! compatibility remains"
+    [ N "spliced"; C ]
+    (record 200 (clauses {
+        yield! [ nonMatch; slowMatch "spliced" 20 ]
+    }))
+
 // ---- summary --------------------------------------------------------------
 
 printfn "\n%s" (String.replicate 50 "-")

@@ -244,8 +244,8 @@ module matching its algebraic role:
 - `orElse` → **`Choice`** (binary race over `amb`).
 - `first` / `firstWhere` → **`Operators`** (query).
 - Dropped as redundant: `chooseFirst`, `matchAny` (≡ `amb`), `both` (≡ `zip`),
-  `caseOf` (≡ `choose`), `clause` (≡ `id`). `clauses { }` now calls `Choice.amb`
-  directly; `Rx.case` calls `AsyncObservable.choose`.
+  `caseOf` (≡ `choose`), `clause` (≡ `id`). `clauses { }` now calls
+  `Choice.firstValue`; `AsyncRx.case` calls `AsyncObservable.choose`.
 
 Behavior is unchanged (suite still 60/60); this is purely structural. The three
 binary stream combinators now read by role: `Merge` (interleave), `Choice`

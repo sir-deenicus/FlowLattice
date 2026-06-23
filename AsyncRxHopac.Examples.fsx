@@ -118,14 +118,13 @@ let patternLikeDemo () =
 
     let result =
         clauses {
-            yield case a (function true -> Some "a was true" | _ -> None)
-            yield case b (function true -> Some "b was true" | _ -> None)
-
-            yield asyncRx {
+            whenValue a ((=) true) "a was true"
+            whenValue b ((=) true) "b was true"
+            always (asyncRx {
                 let! x = a
                 and! y = b
                 return sprintf "fallback: a || b = %b" (x || y)
-            }
+            })
         }
 
     runBlocking result (printfn "%s")
