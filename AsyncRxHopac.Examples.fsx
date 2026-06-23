@@ -1,26 +1,23 @@
 #load "AsyncRxHopac.fsx"
 
 open Hopac
-open AsyncRxHopac
-open AsyncRxHopac.AsyncRx
-open AsyncRxHopac.ClauseCE
-open AsyncRxHopac.Subscribe
+open AsyncRxHopac                  // module prefixes (AsyncObservable, AsyncRx) + the asyncRx/clauses CE values
 
 let backpressureAndCancellationDemo () =
     Hopac.run <| job {
         let fastA =
-            interval 10
-            |> map (fun i -> sprintf "A:%d" i)
+            AsyncObservable.intervalMillis 10
+            |> AsyncObservable.map (fun i -> sprintf "A:%d" i)
 
         let fastB =
-            interval 15
-            |> map (fun i -> sprintf "B:%d" i)
+            AsyncObservable.intervalMillis 15
+            |> AsyncObservable.map (fun i -> sprintf "B:%d" i)
 
         let source =
-            merge [ fastA; fastB ]
+            AsyncObservable.merge [ fastA; fastB ]
 
         let! subscription =
-            subscribeJob
+            AsyncRx.subscribeJob
                 source
                 (fun x -> job {
                     printfn "start processing %s" x
@@ -49,10 +46,10 @@ let backpressureAndCancellationDemo () =
 
 let productMergeDemo () =
     let a =
-        value 10
+        AsyncObservable.singleton 10
 
     let b =
-        value 32
+        AsyncObservable.singleton 32
 
     let result =
         asyncRx {
@@ -61,7 +58,7 @@ let productMergeDemo () =
             return x + y
         }
 
-    runBlocking result (printfn "sum = %d")
+    AsyncRx.runBlocking result (printfn "sum = %d")
 
 /// Walks the `asyncRx { }` computation expression end to end: `for`
 /// (enumeration), `let!`/`and!` (bind + applicative product), `do!`
@@ -76,11 +73,11 @@ let asyncRxBuilderDemo () =
 
             // `let!` binds one value; `and!` pairs a second source
             // applicatively (the zip product surfaced as `and!`).
-            let! x = value 10
-            and! y = value 32
+            let! x = AsyncObservable.singleton 10
+            and! y = AsyncObservable.singleton 32
 
             // `do!` sequences a unit-valued observable for its effect.
-            do! value ()
+            do! AsyncObservable.singleton ()
 
             // `while` loops while the guard holds.
             let mutable k = 0
@@ -91,30 +88,30 @@ let asyncRxBuilderDemo () =
             return x + y
         }
 
-    runBlocking program (printfn "asyncRx result = %d")
+    AsyncRx.runBlocking program (printfn "asyncRx result = %d")
 
 let branchChoiceDemo () =
     let fast =
-        interval 50
-        |> map (fun i -> sprintf "fast:%d" i)
-        |> take 1
+        AsyncObservable.intervalMillis 50
+        |> AsyncObservable.map (fun i -> sprintf "fast:%d" i)
+        |> AsyncObservable.take 1
 
     let slow =
-        interval 200
-        |> map (fun i -> sprintf "slow:%d" i)
-        |> take 1
+        AsyncObservable.intervalMillis 200
+        |> AsyncObservable.map (fun i -> sprintf "slow:%d" i)
+        |> AsyncObservable.take 1
 
     let winner =
-        race [ fast; slow ]
+        AsyncObservable.amb [ fast; slow ]
 
-    runBlocking winner (printfn "winner = %s")
+    AsyncRx.runBlocking winner (printfn "winner = %s")
 
 let patternLikeDemo () =
     let a =
-        value false
+        AsyncObservable.singleton false
 
     let b =
-        value true
+        AsyncObservable.singleton true
 
     let result =
         clauses {
@@ -127,7 +124,7 @@ let patternLikeDemo () =
             })
         }
 
-    runBlocking result (printfn "%s")
+    AsyncRx.runBlocking result (printfn "%s")
 
 printfn "== productMergeDemo =="
 productMergeDemo ()

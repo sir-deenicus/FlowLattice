@@ -9,10 +9,9 @@
 #load "AsyncRxHopac.fsx"
 
 open Hopac
-open Hopac.Infixes
 open AsyncRxHopac
-open AsyncRxHopac.AsyncRxCE
-open AsyncRxHopac.Subscribe
+open AsyncRxHopac.Core
+open AsyncRxHopac.AsyncRx          // bare run-family names: subscribeJob/runJob/...
 
 // ---- recorder -------------------------------------------------------------
 
@@ -75,9 +74,9 @@ let effect (f: unit -> unit) : AsyncObservable<unit> =
         do! obs.OnCompleted()
     }
 
-checkEq "facade: switch alias forwards to switchLatest"
+checkEq "switchLatest: a single inner stream's value is forwarded"
     [ N 42; C ]
-    (record 100 (AsyncRx.switch (AsyncObservable.singleton (AsyncObservable.singleton 42))))
+    (record 100 (AsyncObservable.switchLatest (AsyncObservable.singleton (AsyncObservable.singleton 42))))
 
 // ---- P0-1: terminal-safe bind --------------------------------------------
 
@@ -191,6 +190,31 @@ let recordUntilDone (source: AsyncObservable<'T>) : Ev<'T> list =
     }
     List.ofSeq acc
 
+// ---- source-authoring helpers -------------------------------------------
+
+let unfoldEventChoiceFinite =
+    AsyncObservable.unfoldEventChoice 0 (fun _ state ->
+        if state >= 3 then
+            EventChoice.afterMillis 0 AsyncObservable.Complete
+        else
+            EventChoice.afterMillis 0 (AsyncObservable.Emit (state + 1, state + 1)))
+
+checkEq "unfoldEventChoice: finite state machine emits then completes"
+    [ N 1; N 2; N 3; C ]
+    (recordUntilDone unfoldEventChoiceFinite)
+
+checkEq "unfoldEventChoice: fail step -> one error"
+    [ E "boom" ]
+    (recordUntilDone (
+        AsyncObservable.unfoldEventChoice () (fun _ () ->
+            EventChoice.afterMillis 0 (AsyncObservable.Fail (exn "boom")))))
+
+checkEq "repeatEventChoice: emits until downstream take stops driver"
+    [ N "tick"; N "tick"; C ]
+    (recordUntilDone (
+        AsyncObservable.repeatEventChoice (fun _ -> EventChoice.afterMillis 5 "tick")
+        |> AsyncObservable.take 2))
+
 let bigN = 100000
 
 let mutable forCount = 0
@@ -209,17 +233,16 @@ check "while: 100k synchronous iterations do not overflow the stack"
 
 open System.Threading
 open System.Threading.Tasks
-open AsyncRxHopac.TaskInterop
 
 checkEq "task: normal completion -> one value + completion (and Stop after is safe)"
     [ N 42; C ]
-    (record 100 (ofTaskFactory (fun _ -> Task.FromResult 42)))
+    (record 100 (AsyncObservable.ofTaskFactory (fun _ -> Task.FromResult 42)))
 
 // The Task boundary unwraps a single-inner AggregateException (P2-8), so the
 // underlying fault message ("kaboom") surfaces instead of the AggregateException
 // wrapper ("One or more errors occurred...").
 let faultEvents =
-    record 100 (ofTaskFactory (fun _ ->
+    record 100 (AsyncObservable.ofTaskFactory (fun _ ->
         Task.Run(System.Func<int>(fun () -> raise (exn "kaboom")))))
 checkEq "task: fault -> one error carrying the unwrapped message"
     [ E "kaboom" ] faultEvents
@@ -236,7 +259,7 @@ let longTask (tok: CancellationToken) : Task<int> =
         tok.ThrowIfCancellationRequested()
         99), tok)
 
-let stoppedEvents = record 50 (ofTaskFactory longTask)
+let stoppedEvents = record 50 (AsyncObservable.ofTaskFactory longTask)
 checkEq "task: stop during task -> no notifications" ([]: Ev<int> list) stoppedEvents
 check "task: stop during task -> factory token observed cancellation" tokenSawCancel
 
@@ -402,7 +425,7 @@ check "bind: stop during active inner -> no terminal"
     (terminalCount (record 60 (value 0 |> AsyncObservable.bind (fun _ -> AsyncObservable.intervalMillis 15))) = 0)
 
 check "merge: stop -> no terminal"
-    (terminalCount (record 60 (Merge.merge [ AsyncObservable.intervalMillis 15; AsyncObservable.intervalMillis 18 ])) = 0)
+    (terminalCount (record 60 (AsyncObservable.merge [ AsyncObservable.intervalMillis 15; AsyncObservable.intervalMillis 18 ])) = 0)
 
 check "zip: stop -> no terminal"
     (terminalCount (record 60 (AsyncObservable.zip (AsyncObservable.intervalMillis 15) (AsyncObservable.intervalMillis 18))) = 0)
@@ -431,9 +454,10 @@ let stopOfSeqCompletionFired =
         do! sub.Stop()
         // Bounded so a missing Completion fails visibly rather than hanging.
         let awaitCompletion =
-            (sub.Completion ^-> fun () -> true)
-            <|>
-            (timeOutMillis 1000 ^-> fun () -> false)
+            EventChoice.choose [
+                EventChoice.map (fun () -> true) sub.Completion
+                EventChoice.afterMillis 1000 false
+            ]
         return! awaitCompletion
     }
 check "ofSeq: stop during active iteration -> enumerator disposed" stopOfSeqDisposed.Value
@@ -489,13 +513,11 @@ let bigOfSeqEvents =
 check "ofSeq: 100k synchronous elements do not overflow the stack"
     (ofSeqCount = bigN && List.last bigOfSeqEvents = C)
 
-// ---- clause selection: Choice.firstValue (matching, not first-to-notify) --
-
-open AsyncRxHopac.ClauseCE
+// ---- clause selection: AsyncObservable.firstValue (matching, not first-to-notify) --
 
 // A non-matching clause (choose -> None on a finite source) completes without
 // emitting. Under plain `amb` that completion could win the selection race and
-// yield an empty result; `Choice.firstValue` must discard empty-completers so a
+// yield an empty result; `AsyncObservable.firstValue` must discard empty-completers so a
 // slower clause that actually produces a value is selected instead.
 let nonMatch : AsyncObservable<string> =
     value 1 |> AsyncObservable.choose (fun (_: int) -> (None: string option))
@@ -507,21 +529,21 @@ let slowMatch (label: string) (ms: int) : AsyncObservable<string> =
 
 checkEq "firstValue: empty-completer does not preempt a slower match"
     [ N "b"; C ]
-    (record 200 (Choice.firstValue [ nonMatch; slowMatch "b" 20 ]))
+    (record 200 (AsyncObservable.firstValue [ nonMatch; slowMatch "b" 20 ]))
 
 checkEq "firstValue: all clauses empty -> single completion"
     [ C ]
-    (record 100 (Choice.firstValue [ nonMatch; nonMatch ]))
+    (record 100 (AsyncObservable.firstValue [ nonMatch; nonMatch ]))
 
 checkEq "firstValue: faster value wins, slower clause cancelled"
     [ N "fast"; C ]
-    (record 200 (Choice.firstValue [ slowMatch "fast" 20; slowMatch "slow" 300 ]))
+    (record 200 (AsyncObservable.firstValue [ slowMatch "fast" 20; slowMatch "slow" 300 ]))
 
 checkEq "firstValue: error wins the race"
     [ E "boom" ]
-    (record 200 (Choice.firstValue [ (fail (exn "boom") : AsyncObservable<string>); slowMatch "b" 50 ]))
+    (record 200 (AsyncObservable.firstValue [ (fail (exn "boom") : AsyncObservable<string>); slowMatch "b" 50 ]))
 
-// End-to-end through the clauses { } builder (Run = Choice.firstValue).
+// End-to-end through the clauses { } builder (Run = AsyncObservable.firstValue).
 checkEq "clauses: non-matching clause does not preempt a slower match"
     [ N "b"; C ]
     (record 200 (clauses {

@@ -1,5 +1,5 @@
 (*
-    AsyncRxHopac.fs
+    AsyncRxHopac.fsx
 
     A compact AsyncRx-style kernel for F# built on Hopac.
 
@@ -7,35 +7,56 @@
       - Async push: OnNext returns Job<unit>, so downstream async work can apply backpressure.
       - Hopac-native cancellation: broadcast cancellation via IVar<unit>.
       - Rx-like operators: map, filter, choose, scan, take, merge, amb, debounce, switchLatest.
-      - Combinators by algebraic role: Merge (interleave); Choice (amb/orElse first-to-emit,
-        firstValue clause selection); and the ordinary AsyncObservable transforms/products
-        (map/filter/bind/zip/bothOnce). The clauses { } DSL exposes case/whenValue/
-        guardOn/always clause heads and selects the first *matching* value via
-        Choice.firstValue.
-      - Small ergonomic DSL: asyncRx { ... } and clauses { ... }.
+      - One operator surface (`AsyncObservable`) carries every transform, product, and
+        choice: the interleave (`merge`), the first-to-emit choices (`amb`/`orElse`, and
+        `firstValue` for clause selection), and the ordinary transforms/products
+        (`map`/`filter`/`bind`/`zip`/`bothOnce`). The clauses { } DSL exposes
+        case/whenValue/guardOn/always clause heads and selects the first *matching*
+        value via `AsyncObservable.firstValue`.
+      - Boundaries to the outside world live on that same surface: cold Tasks
+        (`ofTask`/`ofTaskFactory`/`toTaskList`) and pull-shaped AsyncSeqs
+        (`ofAsyncSeq`/`toAsyncSeq`), so there is no separate interop module.
+      - Small ergonomic DSL: `asyncRx { ... }` and `clauses { ... }`, exposed as
+        top-level CE values so a single `open AsyncRxHopac` yields the keywords.
 
-    Package dependency:
+    Module map (kept deliberately small -- see docs/module-consolidation-plan.md):
+      - Core             types only; opened explicitly, never via `open AsyncRxHopac`.
+      - EventChoice      Alt + cancellation substrate for authoring combinators (public).
+      - Internal         private plumbing shared across the operators.
+      - AsyncRx          the run/subscribe front door (consume a stream).
+      - AsyncObservable  the operator surface + Task/AsyncSeq interop + CE builder classes.
+      - asyncRx/clauses  top-level CE values.
+
+    Package dependencies:
       - Hopac
+      - FSharp.Control.AsyncSeq   (only for the ofAsyncSeq/toAsyncSeq bridge)
 
-    Typical package reference:
+    Typical package references:
       <PackageReference Include="Hopac" Version="*" />
+      <PackageReference Include="FSharp.Control.AsyncSeq" Version="*" />
 *)
 
 #r "nuget: Hopac, 0.5.1"
+#r "nuget: FSharp.Control.AsyncSeq"
 
 open System
 open System.Threading
 open System.Threading.Tasks
 open Hopac
-open Hopac.Infixes
+open FSharp.Control
 
-[<AutoOpen>]
 module Core =
 
     type AsyncObserver<'T> =
         { OnNext      : 'T -> Job<unit>
           OnError     : exn -> Job<unit>
           OnCompleted : unit -> Job<unit> }
+
+    /// A pending event choice. AsyncRx exposes this named alias for Hopac `Alt`
+    /// so public examples can talk about event choices without leaning on
+    /// symbolic Hopac operators.
+    type EventChoice<'T> =
+        Alt<'T>
 
     type Subscription =
         { /// Stop the subscription (idempotent): cancels the root context so the
@@ -45,10 +66,10 @@ module Core =
           /// terminal (`OnError`/`OnCompleted`), after Stop-driven unwinding, or
           /// after a thrown source/observer (routed through the boundary gate).
           /// Lets callers await deterministic teardown instead of polling/timeouts.
-          Completion : Alt<unit> }
+          Completion : EventChoice<unit> }
 
     type SubscribeContext =
-        { Stop      : Alt<unit>
+        { Stop      : EventChoice<unit>
           IsStopped : unit -> bool }
 
     // Observable source contract
@@ -81,11 +102,47 @@ module Core =
         | Error of exn
         | Completed
 
-module Cancel =
+// `Core` holds only the library's types. It is opened explicitly here, rather than
+// carrying `[<AutoOpen>]`, so that depending on the core types is always a visible
+// `open` (in this file, and `open AsyncRxHopac.Core` in consumers) -- never an
+// implicit side effect of `open AsyncRxHopac`. Opens are a deliberate choice.
+open Core
 
-    // Cancellation is represented purely by the IVar latch. A real
-    // CancellationToken is created only at boundaries that need one (see
-    // TaskInterop.ofTaskFactory), with an owned, bounded lifetime.
+module EventChoice =
+
+    /// Named wrapper for Hopac's Alt mapping operator.
+    let map (f: 'T -> 'U) (choice: EventChoice<'T>) : EventChoice<'U> =
+        Alt.afterFun f choice
+
+    /// Named wrapper for racing a set of selectable operations.
+    let choose (choices: EventChoice<'T> list) : EventChoice<'T> =
+        Alt.choose choices
+
+    /// Create an event choice that fires when subscription Stop fires.
+    let stop (ctx: SubscribeContext) (value: 'T) : EventChoice<'T> =
+        map (fun () -> value) ctx.Stop
+
+    /// Race a selectable operation against subscription Stop.
+    let orStop (ctx: SubscribeContext) (choice: EventChoice<'T>) : EventChoice<Choice<'T, unit>> =
+        choose [
+            map Choice1Of2 choice
+            stop ctx (Choice2Of2 ())
+        ]
+
+    /// Create an event choice from a channel receive.
+    let take (ch: Ch<'T>) (f: 'T -> 'U) : EventChoice<'U> =
+        map f (Ch.take ch)
+
+    /// Create an event choice from a timeout.
+    let afterMillis (milliseconds: int) (value: 'T) : EventChoice<'T> =
+        map (fun () -> value) (timeOutMillis milliseconds)
+
+    // --- Cancellation (absorbed from the former `Cancel` module) -------------
+    // The public substrate for authoring cancellable combinators. Cancellation
+    // is represented purely by an IVar latch; a real CancellationToken is created
+    // only at boundaries that need one (see `AsyncObservable.ofTaskFactory`),
+    // with an owned, bounded lifetime.
+
     type Token =
         private
             { Latch : IVar<unit> }
@@ -93,7 +150,7 @@ module Cancel =
     let create () : Token =
         { Latch = IVar<unit>() }
 
-    let asAlt (token: Token) : Alt<unit> =
+    let asEventChoice (token: Token) : EventChoice<unit> =
         IVar.read token.Latch
 
     let isCancellationRequested (token: Token) : bool =
@@ -107,9 +164,10 @@ module Cancel =
 
         let ctx =
             { Stop =
-                parent.Stop
-                <|>
-                asAlt token
+                choose [
+                    parent.Stop
+                    asEventChoice token
+                ]
 
               IsStopped =
                 fun () ->
@@ -120,12 +178,12 @@ module Cancel =
 
 module internal Internal =
 
-    let rootContext () : Cancel.Token * SubscribeContext =
-        let token = Cancel.create ()
+    let rootContext () : EventChoice.Token * SubscribeContext =
+        let token = EventChoice.create ()
 
         token,
-        { Stop = Cancel.asAlt token
-          IsStopped = fun () -> Cancel.isCancellationRequested token }
+        { Stop = EventChoice.asEventChoice token
+          IsStopped = fun () -> EventChoice.isCancellationRequested token }
 
     let neverContext : SubscribeContext =
         { Stop = Alt.never ()
@@ -153,15 +211,16 @@ module internal Internal =
         if ctx.IsStopped() then
             Job.unit ()
         else
-            ctx.Stop <|> Ch.give ch value
+            EventChoice.choose [
+                ctx.Stop
+                Ch.give ch value
+            ]
 
     let takeOrStop (ctx: SubscribeContext) (ch: Ch<'T>) : Job<Choice<'T, unit>> =
         if ctx.IsStopped() then
             result (Choice2Of2 ())
         else
-            (ctx.Stop ^-> fun () -> Choice2Of2 ())
-            <|>
-            (Ch.take ch ^-> fun x -> Choice1Of2 x)
+            EventChoice.orStop ctx (Ch.take ch)
 
     /// Subscribe `source` on its own job, forwarding each notification into an
     /// operator mailbox. A thrown source is routed through the same error path as
@@ -191,10 +250,10 @@ module internal Internal =
                 do! send (onError e)
         }
 
-    let cancelMany (tokens: Cancel.Token list) : Job<unit> =
+    let cancelMany (tokens: EventChoice.Token list) : Job<unit> =
         job {
             for token in tokens do
-                do! Cancel.cancel token
+                do! EventChoice.cancel token
         }
 
     /// Wrap an observer so it obeys the terminal grammar even if the source does
@@ -223,7 +282,126 @@ module internal Internal =
                     terminated <- true
                     obs.OnCompleted() }
 
+module AsyncRx =
+
+    let subscribeJob
+        (source: AsyncObservable<'T>)
+        (onNext: 'T -> Job<unit>)
+        (onError: exn -> Job<unit>)
+        (onCompleted: unit -> Job<unit>)
+        : Job<Subscription> =
+
+        job {
+            let cancelToken, ctx =
+                Internal.rootContext ()
+
+            // Final-defense terminal gate: protects this subscriber from a
+            // source that violates the terminal grammar (see the contract on
+            // `AsyncObservable`). The catch routes through the same gate so a
+            // post-terminal throw cannot surface as a second error.
+            let gated =
+                Internal.terminalGate {
+                    OnNext = onNext
+                    OnError = onError
+                    OnCompleted = onCompleted
+                }
+
+            // Filled when the source job finishes (terminal, Stop-unwind, or a
+            // thrown source/observer), so callers can await deterministic teardown.
+            let completed = IVar<unit>()
+
+            do!
+                Job.start (
+                    Job.tryFinallyJob
+                        (job {
+                            try
+                                do! source ctx gated
+                            with e ->
+                                do! gated.OnError e
+                         })
+                        (IVar.tryFill completed ()))
+
+            return {
+                Stop = fun () -> EventChoice.cancel cancelToken
+                Completion = IVar.read completed
+            }
+        }
+
+    let runJob
+        (source: AsyncObservable<'T>)
+        (onNext: 'T -> Job<unit>)
+        (onError: exn -> Job<unit>)
+        (onCompleted: unit -> Job<unit>)
+        : Job<unit> =
+
+        // Same boundary terminal gate as `subscribeJob` (see the contract on
+        // `AsyncObservable`); also catches a source that throws after a terminal.
+        let gated =
+            Internal.terminalGate {
+                OnNext = onNext
+                OnError = onError
+                OnCompleted = onCompleted
+            }
+
+        job {
+            try
+                do! source Internal.neverContext gated
+            with e ->
+                do! gated.OnError e
+        }
+
+    let runBlocking (source: AsyncObservable<'T>) (onNext: 'T -> unit) : unit =
+        Hopac.run <|
+            runJob
+                source
+                (fun x -> job { onNext x })
+                (fun e -> job { raise e })
+                (fun () -> Job.unit ())
+
+    /// Run `source` to its terminal, blocking the calling thread until then, with
+    /// plain (synchronous) lifecycle handlers. This is the Hopac-free entry point
+    /// for *consuming* a stream: no `job { }` and no `Hopac.run` at the call site,
+    /// so application/example code can stay in AsyncRx vocabulary. Pipe-friendly
+    /// (source last): `commands |> run onCmd onError onDone`. The handlers are
+    /// synchronous, so the sink exerts no backpressure on the source -- when the
+    /// consumer must pace the producer, drop to `runJob` / `subscribeJob` with
+    /// `Job<unit>` handlers instead.
+    let run
+        (onNext: 'T -> unit)
+        (onError: exn -> unit)
+        (onCompleted: unit -> unit)
+        (source: AsyncObservable<'T>)
+        : unit =
+        Hopac.run <|
+            runJob
+                source
+                (fun x -> job { onNext x })
+                (fun e -> job { onError e })
+                (fun () -> job { onCompleted () })
+
+    let subscribe
+        (source: AsyncObservable<'T>)
+        (onNext: 'T -> unit)
+        : Subscription =
+
+        Hopac.run <|
+            subscribeJob
+                source
+                (fun x -> job { onNext x })
+                (fun e -> job { raise e })
+                (fun () -> Job.unit ())
+
 module AsyncObservable =
+
+    type SourceStep<'State, 'T> =
+        | Emit of 'T * 'State
+        | Continue of 'State
+        | Complete
+        | Fail of exn
+
+    type private DriverStep<'State, 'T> =
+        | DriverStopped
+        | DriverNext of SourceStep<'State, 'T>
 
     let private relayNext
         (onNext: 'T -> Job<unit>)
@@ -255,10 +433,65 @@ module AsyncObservable =
         fun ctx _ ->
             ctx.Stop
 
+    /// Build a source from a state machine whose next transition is a selectable
+    /// Hopac operation. The driver owns Stop racing, looping, OnNext
+    /// acknowledgement, and terminal forwarding.
+    let unfoldEventChoice
+        (initial: 'State)
+        (next: SubscribeContext -> 'State -> EventChoice<SourceStep<'State, 'T>>)
+        : AsyncObservable<'T> =
+
+        fun ctx obs ->
+            let rec loop state =
+                job {
+                    if ctx.IsStopped() then
+                        return ()
+                    else
+                        let! step =
+                            EventChoice.choose [
+                                EventChoice.stop ctx DriverStopped
+                                EventChoice.map DriverNext (next ctx state)
+                            ]
+
+                        match step with
+                        | DriverStopped ->
+                            return ()
+
+                        | DriverNext (Emit (value, nextState)) ->
+                            do! obs.OnNext value
+                            return! loop nextState
+
+                        | DriverNext (Continue nextState) ->
+                            return! loop nextState
+
+                        | DriverNext Complete ->
+                            do! Internal.runUnlessStopped ctx (obs.OnCompleted())
+
+                        | DriverNext (Fail ex) ->
+                            do! Internal.runUnlessStopped ctx (obs.OnError ex)
+                }
+
+            job {
+                try
+                    do! loop initial
+                with ex ->
+                    do! Internal.runUnlessStopped ctx (obs.OnError ex)
+            }
+
+    /// Build a source by repeatedly selecting the next value until Stop wins.
+    let repeatEventChoice
+        (next: SubscribeContext -> EventChoice<'T>)
+        : AsyncObservable<'T> =
+
+        unfoldEventChoice
+            ()
+            (fun ctx () ->
+                EventChoice.map (fun value -> Emit (value, ())) (next ctx))
+
     let ofSeq (xs: seq<'T>) : AsyncObservable<'T> =
-        // Mirrors the hardened `AsyncRxCE.For` enumerator lifecycle: acquire the
-        // enumerator inside the protected scope, iterate with a stack-safe Hopac
-        // `while` loop (not `return! loop ()`, which overflows for fully
+        // Mirrors the hardened `AsyncRxBuilder.For` enumerator lifecycle: acquire
+        // the enumerator inside the protected scope, iterate with a stack-safe
+        // Hopac `while` loop (not `return! loop ()`, which overflows for fully
         // synchronous downstreams), dispose *before* completing, and turn any
         // acquisition/iteration/disposal failure into exactly one OnError.
         fun ctx obs -> job {
@@ -318,9 +551,10 @@ module AsyncObservable =
             let rec loop i =
                 job {
                     let! next =
-                        (ctx.Stop ^-> fun () -> Choice2Of2 ())
-                        <|>
-                        (timeOutMillis periodMs ^-> fun () -> Choice1Of2 ())
+                        EventChoice.choose [
+                            EventChoice.stop ctx (Choice2Of2 ())
+                            EventChoice.afterMillis periodMs (Choice1Of2 ())
+                        ]
 
                     match next with
                     | Choice2Of2 () ->
@@ -401,7 +635,7 @@ module AsyncObservable =
     let bind (f: 'T -> AsyncObservable<'U>) (source: AsyncObservable<'T>) : AsyncObservable<'U> =
         fun ctx obs -> job {
             let childCancel, childCtx =
-                Cancel.childContext ctx
+                EventChoice.childContext ctx
 
             // Observer callbacks here are serialized: the outer source drives OnNext,
             // which awaits the inner subscription to completion before the next
@@ -412,7 +646,7 @@ module AsyncObservable =
                 job {
                     if not terminated then
                         terminated <- true
-                        do! Cancel.cancel childCancel
+                        do! EventChoice.cancel childCancel
                         do! final
                 }
 
@@ -451,7 +685,7 @@ module AsyncObservable =
                 do! Internal.runUnlessStopped outerCtx (obs.OnCompleted())
             else
                 let localCancel, innerCtx =
-                    Cancel.childContext outerCtx
+                    EventChoice.childContext outerCtx
 
                 let mutable seen = 0
                 let mutable completed = false
@@ -464,14 +698,14 @@ module AsyncObservable =
 
                             if seen >= count then
                                 completed <- true
-                                do! Cancel.cancel localCancel
+                                do! EventChoice.cancel localCancel
                                 do! obs.OnCompleted()
                     }
 
                     OnError = fun e -> job {
                         if not completed then
                             completed <- true
-                            do! Cancel.cancel localCancel
+                            do! EventChoice.cancel localCancel
                             do! obs.OnError e
                     }
 
@@ -514,7 +748,7 @@ module AsyncObservable =
 
         fun outerCtx obs -> job {
             let operatorCancel, operatorCtx =
-                Cancel.childContext outerCtx
+                EventChoice.childContext outerCtx
 
             let events =
                 Ch<SwitchMsg<'T>>()
@@ -534,7 +768,7 @@ module AsyncObservable =
             let startInner generation (inner: AsyncObservable<'T>) =
                 job {
                     let innerCancel, innerCtx =
-                        Cancel.childContext operatorCtx
+                        EventChoice.childContext operatorCtx
 
                     do!
                         Internal.forwardInto
@@ -555,13 +789,13 @@ module AsyncObservable =
 
                     match next with
                     | Choice2Of2 () ->
-                        do! Cancel.cancel operatorCancel
+                        do! EventChoice.cancel operatorCancel
 
                     | Choice1Of2 msg ->
                         match msg with
                         | OuterNext inner ->
                             match currentInner with
-                            | Some cancel -> do! Cancel.cancel cancel
+                            | Some cancel -> do! EventChoice.cancel cancel
                             | None -> ()
 
                             let generation' =
@@ -573,14 +807,14 @@ module AsyncObservable =
                             return! loop generation' (Some innerCancel) outerDone true
 
                         | OuterError e ->
-                            do! Cancel.cancel operatorCancel
+                            do! EventChoice.cancel operatorCancel
                             do! obs.OnError e
 
                         | OuterCompleted ->
                             if innerActive then
                                 return! loop generation currentInner true innerActive
                             else
-                                do! Cancel.cancel operatorCancel
+                                do! EventChoice.cancel operatorCancel
                                 do! obs.OnCompleted()
 
                         | InnerNext (g, x) when g = generation && innerActive ->
@@ -588,16 +822,16 @@ module AsyncObservable =
                             return! loop generation currentInner outerDone innerActive
 
                         | InnerError (g, e) when g = generation && innerActive ->
-                            do! Cancel.cancel operatorCancel
+                            do! EventChoice.cancel operatorCancel
                             do! obs.OnError e
 
                         | InnerCompleted g when g = generation && innerActive ->
                             match currentInner with
-                            | Some cancel -> do! Cancel.cancel cancel
+                            | Some cancel -> do! EventChoice.cancel cancel
                             | None -> ()
 
                             if outerDone then
-                                do! Cancel.cancel operatorCancel
+                                do! EventChoice.cancel operatorCancel
                                 do! obs.OnCompleted()
                             else
                                 return! loop generation None outerDone false
@@ -631,7 +865,7 @@ module AsyncObservable =
                     )
             else
                 let localCancel, innerCtx =
-                    Cancel.childContext outerCtx
+                    EventChoice.childContext outerCtx
 
                 let inbox =
                     Ch<Notification<'T>>()
@@ -651,10 +885,10 @@ module AsyncObservable =
                 let rec loop pending =
                     job {
                         let sourceAlt =
-                            Ch.take inbox ^-> fun msg -> DebounceSource msg
+                            EventChoice.take inbox DebounceSource
 
                         let stopAlt =
-                            outerCtx.Stop ^-> fun () -> DebounceStopped
+                            EventChoice.stop outerCtx DebounceStopped
 
                         let alts =
                             match pending with
@@ -668,28 +902,28 @@ module AsyncObservable =
                                 // replacing with a generation-tagged/cancellable timer.
                                 [ stopAlt
                                   sourceAlt
-                                  timeOutMillis dueMs ^-> fun () -> DebounceDue ]
+                                  EventChoice.afterMillis dueMs DebounceDue ]
 
                             | None ->
                                 [ stopAlt
                                   sourceAlt ]
 
                         let! event =
-                            Alt.choose alts
+                            EventChoice.choose alts
 
                         match event with
                         | DebounceStopped ->
-                            do! Cancel.cancel localCancel
+                            do! EventChoice.cancel localCancel
 
                         | DebounceSource (Next x) ->
                             return! loop (Some x)
 
                         | DebounceSource (Error e) ->
-                            do! Cancel.cancel localCancel
+                            do! EventChoice.cancel localCancel
                             do! obs.OnError e
 
                         | DebounceSource Completed ->
-                            do! Cancel.cancel localCancel
+                            do! EventChoice.cancel localCancel
 
                             match pending with
                             | Some x ->
@@ -735,8 +969,9 @@ module AsyncObservable =
         | RightCompleted
 
     /// Applicative stream product: pairs the i-th `left` value with the i-th
-    /// `right` value. `AsyncRxCE.MergeSources` surfaces this as `and!`. Distinct
-    /// from `Merge` (interleave) and `Choice` (first-to-emit).
+    /// `right` value. `AsyncRxBuilder.MergeSources` surfaces this as `and!`.
+    /// Distinct from `merge` (interleave) and the first-to-emit choices
+    /// (`amb`/`orElse`/`firstValue`).
     ///
     /// Unbounded buffering (P2-1): each side is queued until its counterpart
     /// arrives, so if one source outruns the other the faster side's queue grows
@@ -751,7 +986,7 @@ module AsyncObservable =
 
         fun outerCtx obs -> job {
             let localCancel, innerCtx =
-                Cancel.childContext outerCtx
+                EventChoice.childContext outerCtx
 
             let inbox =
                 Ch<ZipMsg<'T, 'U>>()
@@ -793,11 +1028,11 @@ module AsyncObservable =
                         return! emitAvailable leftDone rightDone
 
                     elif leftQueue.Count = 0 && leftDone then
-                        do! Cancel.cancel localCancel
+                        do! EventChoice.cancel localCancel
                         do! obs.OnCompleted()
 
                     elif rightQueue.Count = 0 && rightDone then
-                        do! Cancel.cancel localCancel
+                        do! EventChoice.cancel localCancel
                         do! obs.OnCompleted()
 
                     else
@@ -806,7 +1041,7 @@ module AsyncObservable =
 
                         match msg with
                         | Choice2Of2 () ->
-                            do! Cancel.cancel localCancel
+                            do! EventChoice.cancel localCancel
 
                         | Choice1Of2 (LeftNext x) ->
                             leftQueue.Enqueue x
@@ -818,7 +1053,7 @@ module AsyncObservable =
 
                         | Choice1Of2 (LeftError e)
                         | Choice1Of2 (RightError e) ->
-                            do! Cancel.cancel localCancel
+                            do! EventChoice.cancel localCancel
                             do! obs.OnError e
 
                         | Choice1Of2 LeftCompleted ->
@@ -840,7 +1075,8 @@ module AsyncObservable =
         zip (first left) (first right)
         |> first
 
-module Merge =
+    // --- Merge: interleave every source's notifications -----------------------
+    // (folded in from the former `Merge` module).
 
     let merge (sources: AsyncObservable<'T> list) : AsyncObservable<'T> =
         fun outerCtx obs -> job {
@@ -850,7 +1086,7 @@ module Merge =
 
             | _ ->
                 let localCancel, innerCtx =
-                    Cancel.childContext outerCtx
+                    EventChoice.childContext outerCtx
 
                 let out =
                     Ch<Notification<'T>>()
@@ -878,14 +1114,14 @@ module Merge =
 
                             match msg with
                             | Choice2Of2 () ->
-                                do! Cancel.cancel localCancel
+                                do! EventChoice.cancel localCancel
 
                             | Choice1Of2 (Next x) ->
                                 do! obs.OnNext x
                                 return! loop remaining
 
                             | Choice1Of2 (Error e) ->
-                                do! Cancel.cancel localCancel
+                                do! EventChoice.cancel localCancel
                                 do! obs.OnError e
 
                             | Choice1Of2 Completed ->
@@ -898,17 +1134,20 @@ module Merge =
     let merge2 a b =
         merge [ a; b ]
 
-module Choice =
+    // --- Choice: first-to-emit races ------------------------------------------
+    // (folded in from the former `Choice` module). `amb`/`orElse` race for the
+    // first notification; `firstValue` races for the first *value* (clause
+    // selection) and discards empty-completers.
 
     type private SourceEntry<'T> =
-        { Cancel : Cancel.Token
+        { Cancel : EventChoice.Token
           Ctx : SubscribeContext
           Ch : Ch<Notification<'T>>
           Source : AsyncObservable<'T> }
 
     let private sourceEntry outerCtx source =
         let childCancel, childCtx =
-            Cancel.childContext outerCtx
+            EventChoice.childContext outerCtx
 
         { Cancel = childCancel
           Ctx = childCtx
@@ -956,12 +1195,10 @@ module Choice =
                 let indexedTakes =
                     entries
                     |> List.mapi (fun i entry ->
-                        Ch.take entry.Ch ^-> fun msg -> i, msg)
+                        EventChoice.take entry.Ch (fun msg -> i, msg))
 
                 let! first =
-                    (outerCtx.Stop ^-> fun () -> Choice2Of2 ())
-                    <|>
-                    (Alt.choose indexedTakes ^-> fun x -> Choice1Of2 x)
+                    EventChoice.orStop outerCtx (EventChoice.choose indexedTakes)
 
                 match first with
                 | Choice2Of2 () ->
@@ -980,23 +1217,21 @@ module Choice =
                                 do! obs.OnNext x
 
                                 let! next =
-                                    (outerCtx.Stop ^-> fun () -> Choice2Of2 ())
-                                    <|>
-                                    (Ch.take winner.Ch ^-> fun x -> Choice1Of2 x)
+                                    EventChoice.orStop outerCtx (Ch.take winner.Ch)
 
                                 match next with
                                 | Choice2Of2 () ->
-                                    do! Cancel.cancel winner.Cancel
+                                    do! EventChoice.cancel winner.Cancel
 
                                 | Choice1Of2 msg' ->
                                     return! forward msg'
 
                             | Error e ->
-                                do! Cancel.cancel winner.Cancel
+                                do! EventChoice.cancel winner.Cancel
                                 do! obs.OnError e
 
                             | Completed ->
-                                do! Cancel.cancel winner.Cancel
+                                do! EventChoice.cancel winner.Cancel
                                 do! obs.OnCompleted()
                         }
 
@@ -1050,24 +1285,22 @@ module Choice =
                 let rec forward winnerIndex =
                     job {
                         let! next =
-                            (outerCtx.Stop ^-> fun () -> Choice2Of2 ())
-                            <|>
-                            (Ch.take (channelOf winnerIndex) ^-> fun x -> Choice1Of2 x)
+                            EventChoice.orStop outerCtx (Ch.take (channelOf winnerIndex))
 
                         match next with
                         | Choice2Of2 () ->
-                            do! Cancel.cancel (cancelOf winnerIndex)
+                            do! EventChoice.cancel (cancelOf winnerIndex)
 
                         | Choice1Of2 (Next x) ->
                             do! obs.OnNext x
                             return! forward winnerIndex
 
                         | Choice1Of2 (Error e) ->
-                            do! Cancel.cancel (cancelOf winnerIndex)
+                            do! EventChoice.cancel (cancelOf winnerIndex)
                             do! obs.OnError e
 
                         | Choice1Of2 Completed ->
-                            do! Cancel.cancel (cancelOf winnerIndex)
+                            do! EventChoice.cancel (cancelOf winnerIndex)
                             do! obs.OnCompleted()
                     }
 
@@ -1084,12 +1317,10 @@ module Choice =
                             let indexedTakes =
                                 active
                                 |> List.map (fun i ->
-                                    Ch.take (channelOf i) ^-> fun msg -> i, msg)
+                                    EventChoice.take (channelOf i) (fun msg -> i, msg))
 
                             let! winner =
-                                (outerCtx.Stop ^-> fun () -> Choice2Of2 ())
-                                <|>
-                                (Alt.choose indexedTakes ^-> fun x -> Choice1Of2 x)
+                                EventChoice.orStop outerCtx (EventChoice.choose indexedTakes)
 
                             match winner with
                             | Choice2Of2 () ->
@@ -1105,25 +1336,261 @@ module Choice =
                                 do! obs.OnError e
 
                             | Choice1Of2 (i, Completed) ->
-                                do! Cancel.cancel (cancelOf i)
+                                do! EventChoice.cancel (cancelOf i)
                                 return! select (List.filter (fun j -> j <> i) active)
                     }
 
                 do! select [ 0 .. entries.Length - 1 ]
         }
 
-module AsyncRxCE =
+    // --- Task boundaries (folded in from the former `TaskInterop` module) -----
+
+    open Hopac.Extensions
+
+    /// Cold, cancellable Task boundary.
+    ///
+    /// The Task is created at subscription time.
+    /// Cancellation is exposed to the factory via CancellationToken.
+    let ofTaskFactory
+        (makeTask: CancellationToken -> Task<'T>)
+        : AsyncObservable<'T> =
+
+        fun ctx obs -> job {
+            let linked =
+                CancellationTokenSource.CreateLinkedTokenSource(CancellationToken.None)
+
+            try
+                try
+                    let task =
+                        makeTask linked.Token
+
+                    // Bridge task completion into an IVar so it can be raced against
+                    // Stop as an Alt. The bridge observes the task's outcome (success
+                    // or fault), so a cancelled task never raises unobserved.
+                    let outcome = IVar<Choice<'T, exn>>()
+
+                    do!
+                        Job.start <| job {
+                            try
+                                let! x = Job.awaitTask task
+                                do! IVar.fill outcome (Choice1Of2 x)
+                            with e ->
+                                do! IVar.fill outcome (Choice2Of2 e)
+                        }
+
+                    let! winner =
+                        EventChoice.orStop ctx (IVar.read outcome)
+
+                    match winner with
+                    | Choice2Of2 () ->
+                        // Subscription stopped: cancel the task and terminate silently.
+                        // Disposal happens in the finally, after Cancel, so the bridge
+                        // (which never touches `linked`) cannot race a disposed CTS.
+                        linked.Cancel()
+
+                    | Choice1Of2 (Choice1Of2 x) ->
+                        if not (ctx.IsStopped()) then
+                            do! obs.OnNext x
+                            do! Internal.runUnlessStopped ctx (obs.OnCompleted())
+
+                    | Choice1Of2 (Choice2Of2 e) ->
+                        // A genuine task fault/cancellation (subscription not stopped).
+                        // `Job.awaitTask` surfaces a faulted Task as its wrapping
+                        // AggregateException; unwrap a single inner exception so the
+                        // underlying fault/message surfaces instead of the wrapper.
+                        let unwrapped =
+                            match e with
+                            | :? AggregateException as agg when agg.InnerExceptions.Count = 1 ->
+                                agg.InnerExceptions.[0]
+                            | _ -> e
+
+                        let err =
+                            match unwrapped with
+                            | :? OperationCanceledException ->
+                                OperationCanceledException("Task was cancelled.") :> exn
+                            | _ -> unwrapped
+
+                        do! Internal.runUnlessStopped ctx (obs.OnError err)
+                with e ->
+                    do! Internal.runUnlessStopped ctx (obs.OnError e)
+            finally
+                linked.Dispose()
+        }
+
+    /// Cold Task boundary without a useful CancellationToken.
+    let ofTask (makeTask: unit -> Task<'T>) : AsyncObservable<'T> =
+        ofTaskFactory (fun _ -> makeTask())
+
+    /// Hot/eager Task boundary. Use only when the Task intentionally already exists.
+    let ofHotTask (task: Task<'T>) : AsyncObservable<'T> =
+        ofTask (fun () -> task)
+
+    let toTaskList (source: AsyncObservable<'T>) : Task<'T list> =
+        let results = ResizeArray<'T>()
+
+        Hopac.startAsTask <| job {
+            do!
+                AsyncRx.runJob
+                    source
+                    (fun x -> job { results.Add x })
+                    (fun e -> job { raise e })
+                    (fun () -> Job.unit ())
+
+            return List.ofSeq results
+        }
+
+    // --- AsyncSeq boundaries (folded in from the former AsyncRxAsyncSeq.fsx) ---
+    // A small bidirectional bridge between the push-shaped kernel and the
+    // pull-shaped FSharp.Control.AsyncSeq: `ofAsyncSeq` (pull -> push) and
+    // `toAsyncSeq` (push -> pull, via a Hopac `Ch` synchronous rendezvous --
+    // lossless, bounded, no buffer-size policy). The bridge crosses the
+    // Async <-> Job runtime boundary once per element, so keep it off
+    // Hopac-native hot paths. Design notes: docs/asyncrx-asyncseq-plan.md.
+
+    /// A faulted AsyncSeq/Task arrives wrapped in an AggregateException (the same
+    /// Task-boundary behaviour `ofTaskFactory` above unwraps). Peel a
+    /// single-inner one so the bridge surfaces the source's real exception rather
+    /// than "One or more errors occurred."
+    let rec private unwrapAggregate (ex: exn) : exn =
+        match ex with
+        | :? System.AggregateException as agg when agg.InnerExceptions.Count = 1 ->
+            unwrapAggregate agg.InnerExceptions.[0]
+        | _ -> ex
+
+    /// pull -> push. A near-exact mirror of `ofSeq` (above): acquire the
+    /// enumerator inside the protected scope, iterate with a stack-safe Hopac
+    /// `while` loop, dispose *before* completing, and turn any
+    /// acquisition/iteration/disposal failure into exactly one `OnError`. The
+    /// only change from `ofSeq` is that each step is an async pull.
+    ///
+    /// AsyncSeq 4.x is built on the BCL `IAsyncEnumerable<'T>`, so the steps are
+    /// `MoveNextAsync () : ValueTask<bool>` / `Current` / `DisposeAsync ()`, bridged
+    /// into the Hopac job via `Async.AwaitTask` (which unwraps a single inner
+    /// exception, so a throwing source surfaces its real message, not an
+    /// AggregateException). Backpressure falls out for free: `do! obs.OnNext x`
+    /// awaits the downstream Job before the next `MoveNextAsync`, so the pull is
+    /// paced by the consumer. Async disposal forces `Job.tryFinallyJob` rather than
+    /// the kernel's synchronous `try/finally`, but the lifecycle ordering matches.
+    let ofAsyncSeq (xs: AsyncSeq<'T>) : AsyncObservable<'T> =
+        fun ctx obs ->
+            let mutable terminated = false
+            let mutable enumerator : System.Collections.Generic.IAsyncEnumerator<'T> option = None
+
+            let forwardError (ex: exn) = job {
+                if not terminated then
+                    terminated <- true
+                    do! obs.OnError ex
+            }
+
+            // DisposeAsync at most once, surfacing any failure so the caller can
+            // decide whether it becomes the (single) terminal.
+            let disposeAsync () : Job<exn option> =
+                match enumerator with
+                | None -> Job.result None
+                | Some en ->
+                    enumerator <- None
+                    job {
+                        try
+                            do! Job.fromAsync (Async.AwaitTask (en.DisposeAsync().AsTask()))
+                            return None
+                        with ex -> return Some (unwrapAggregate ex)
+                    }
+
+            Job.tryFinallyJob
+                (job {
+                    try
+                        // Acquire inside the protected scope: a throwing
+                        // GetAsyncEnumerator becomes one OnError instead of escaping.
+                        enumerator <- Some (xs.GetAsyncEnumerator(CancellationToken.None))
+                        let en = enumerator.Value
+                        let mutable finished = false
+
+                        // Hopac's job `while` loop is iterative, so this stays
+                        // stack-safe even for fully synchronous AsyncSeqs.
+                        while not finished && not terminated && not (ctx.IsStopped()) do
+                            let! hasNext = Job.fromAsync (Async.AwaitTask (en.MoveNextAsync().AsTask()))
+                            if hasNext then do! obs.OnNext en.Current
+                            else finished <- true
+
+                        // Normal exhaustion: dispose *before* completing, and turn a
+                        // disposal failure into the single terminal error.
+                        if finished && not terminated && not (ctx.IsStopped()) then
+                            let! disposed = disposeAsync ()
+                            match disposed with
+                            | Some ex -> do! forwardError ex
+                            | None ->
+                                terminated <- true
+                                do! obs.OnCompleted()
+                    with ex ->
+                        do! forwardError (unwrapAggregate ex)
+                 })
+                // Error / stop / acquisition-failure paths: ensure disposal,
+                // swallowing any failure (the terminal is already decided).
+                (job {
+                    let! _ = disposeAsync ()
+                    return ()
+                 })
+
+    /// push -> pull. Bridge through a Hopac `Ch` (synchronous rendezvous): the
+    /// producer's `OnNext` *gives* on the channel, the AsyncSeq generator *takes* on
+    /// each pull, and the give does not complete until the take happens. Lossless,
+    /// bounded, no buffer-size knob. The terminal is carried in-band as the kernel's
+    /// `Notification`, so no side completion signal is needed.
+    ///
+    /// `Internal.forwardInto` + `Internal.giveOrStop` are reused verbatim:
+    /// `forwardInto` subscribes the source on its own job and funnels every
+    /// notification (turning a thrown source into one `Error`); `giveOrStop` makes
+    /// each give a rendezvous that loses to Stop, so cancelling the root token
+    /// withdraws a blocked give. The `finally` cancels that token on normal end OR
+    /// early disposal, unwinding the producer subscription either way.
+    let toAsyncSeq (source: AsyncObservable<'T>) : AsyncSeq<'T> =
+        asyncSeq {
+            let token, ctx = Internal.rootContext ()
+            let ch = Ch<Notification<'T>> ()
+
+            // Start the producer and return immediately (forwardInto Job.start's it).
+            do!
+                Job.toAsync (
+                    Internal.forwardInto
+                        ctx
+                        source
+                        Notification.Next
+                        Notification.Error
+                        Notification.Completed
+                        (Internal.giveOrStop ctx ch))
+
+            try
+                let mutable go = true
+                while go do
+                    let! n = Job.toAsync (Ch.take ch)   // pull == take (rendezvous)
+                    match n with
+                    | Notification.Next x    -> yield x
+                    | Notification.Completed -> go <- false
+                    | Notification.Error e   -> raise e  // surface the fault on the seq
+            finally
+                // Normal end OR early disposal (consumer stopped pulling): cancel so a
+                // blocked giveOrStop is withdrawn and the producer subscription
+                // unwinds. cancel is an idempotent, non-blocking IVar fill; fire it
+                // and forget (AsyncSeq's finally is synchronous, and we must not risk
+                // a Hopac.run from a worker thread).
+                Hopac.start (EventChoice.cancel token)
+        }
+
+    // --- Computation-expression builder classes -------------------------------
+    // (folded in from the former `AsyncRxCE`/`ClauseCE` modules). The CE *values*
+    // `asyncRx`/`clauses` live at the top level, so a single `open AsyncRxHopac`
+    // yields the keywords without flooding the operator names into scope.
 
     type AsyncRxBuilder() =
 
         member _.Return(x: 'T) : AsyncObservable<'T> =
-            AsyncObservable.singleton x
+            singleton x
 
         member _.ReturnFrom(source: AsyncObservable<'T>) : AsyncObservable<'T> =
             source
 
         member _.Zero() : AsyncObservable<unit> =
-            AsyncObservable.empty
+            empty
 
         member _.Delay(f: unit -> AsyncObservable<'T>) : AsyncObservable<'T> =
             fun ctx obs ->
@@ -1135,7 +1602,7 @@ module AsyncRxCE =
                 f: 'T -> AsyncObservable<'U>
             ) : AsyncObservable<'U> =
 
-            AsyncObservable.bind f source
+            bind f source
 
         // Statement sequencing: ignore the values of `first`, and start `second`
         // exactly once when `first` completes normally (never after an error).
@@ -1298,7 +1765,7 @@ module AsyncRxCE =
                 right: AsyncObservable<'U>
             ) : AsyncObservable<'T * 'U> =
 
-            AsyncObservable.zip left right
+            zip left right
 
         member _.BindReturn
             (
@@ -1306,15 +1773,10 @@ module AsyncRxCE =
                 f: 'T -> 'U
             ) : AsyncObservable<'U> =
 
-            AsyncObservable.map f source
+            map f source
 
         member _.Run(source: AsyncObservable<'T>) : AsyncObservable<'T> =
             source
-
-    let asyncRx =
-        AsyncRxBuilder()
-
-module ClauseCE =
 
     type ClausesBuilder() =
 
@@ -1345,7 +1807,7 @@ module ClauseCE =
                 source: AsyncObservable<'U>,
                 chooser: 'U -> 'T option
             ) =
-            state @ [ AsyncObservable.choose chooser source ]
+            state @ [ choose chooser source ]
 
         /// Match when `source` emits a value satisfying `predicate`, then return
         /// the supplied result as this clause's value.
@@ -1357,10 +1819,10 @@ module ClauseCE =
                 predicate: 'T -> bool,
                 result: 'U
             ) =
-            state @ [ source |> AsyncObservable.filter predicate |> AsyncObservable.map (fun _ -> result) ]
+            state @ [ source |> filter predicate |> map (fun _ -> result) ]
 
         /// Add a boolean guard clause. A false guard completes empty and is
-        /// ignored by `Choice.firstValue`.
+        /// ignored by `AsyncObservable.firstValue`.
         [<CustomOperation("guardOn")>]
         member _.GuardOn
             (
@@ -1368,7 +1830,7 @@ module ClauseCE =
                 condition: bool,
                 result: 'T
             ) =
-            state @ [ AsyncObservable.guard condition |> AsyncObservable.map (fun () -> result) ]
+            state @ [ guard condition |> map (fun () -> result) ]
 
         /// Add an unguarded clause. This is not ordered fallback semantics; it
         /// participates in the same first-value race as every other clause.
@@ -1381,277 +1843,18 @@ module ClauseCE =
             state @ [ source ]
 
         /// Selects the first clause to emit a *value*. A non-matching clause
-        /// (built with `AsyncObservable.guard` / `AsyncObservable.choose`) completes without
-        /// emitting; `Choice.firstValue` discards such empty-completers rather
-        /// than letting their completion win the race (which plain `amb` would),
-        /// so a slower clause that actually matches still gets selected.
+        /// (built with `AsyncObservable.guard` / `AsyncObservable.choose`) completes
+        /// without emitting; `AsyncObservable.firstValue` discards such
+        /// empty-completers rather than letting their completion win the race (which
+        /// plain `amb` would), so a slower clause that actually matches still gets
+        /// selected.
         member _.Run(xs: AsyncObservable<'T> list) =
-            Choice.firstValue xs
+            firstValue xs
 
-    let clauses =
-        ClausesBuilder()
+// Top-level CE values: a single `open AsyncRxHopac` brings `asyncRx`/`clauses`
+// into scope (the builder *keywords*) without also flooding the operator names.
+let asyncRx =
+    AsyncObservable.AsyncRxBuilder()
 
-module Subscribe =
-
-    let subscribeJob
-        (source: AsyncObservable<'T>)
-        (onNext: 'T -> Job<unit>)
-        (onError: exn -> Job<unit>)
-        (onCompleted: unit -> Job<unit>)
-        : Job<Subscription> =
-
-        job {
-            let cancelToken, ctx =
-                Internal.rootContext ()
-
-            // Final-defense terminal gate: protects this subscriber from a
-            // source that violates the terminal grammar (see the contract on
-            // `AsyncObservable`). The catch routes through the same gate so a
-            // post-terminal throw cannot surface as a second error.
-            let gated =
-                Internal.terminalGate {
-                    OnNext = onNext
-                    OnError = onError
-                    OnCompleted = onCompleted
-                }
-
-            // Filled when the source job finishes (terminal, Stop-unwind, or a
-            // thrown source/observer), so callers can await deterministic teardown.
-            let completed = IVar<unit>()
-
-            do!
-                Job.start (
-                    Job.tryFinallyJob
-                        (job {
-                            try
-                                do! source ctx gated
-                            with e ->
-                                do! gated.OnError e
-                         })
-                        (IVar.tryFill completed ()))
-
-            return {
-                Stop = fun () -> Cancel.cancel cancelToken
-                Completion = IVar.read completed
-            }
-        }
-
-    let runJob
-        (source: AsyncObservable<'T>)
-        (onNext: 'T -> Job<unit>)
-        (onError: exn -> Job<unit>)
-        (onCompleted: unit -> Job<unit>)
-        : Job<unit> =
-
-        // Same boundary terminal gate as `subscribeJob` (see the contract on
-        // `AsyncObservable`); also catches a source that throws after a terminal.
-        let gated =
-            Internal.terminalGate {
-                OnNext = onNext
-                OnError = onError
-                OnCompleted = onCompleted
-            }
-
-        job {
-            try
-                do! source Internal.neverContext gated
-            with e ->
-                do! gated.OnError e
-        }
-
-    let runBlocking (source: AsyncObservable<'T>) (onNext: 'T -> unit) : unit =
-        Hopac.run <|
-            runJob
-                source
-                (fun x -> job { onNext x })
-                (fun e -> job { raise e })
-                (fun () -> Job.unit ())
-
-    let subscribe
-        (source: AsyncObservable<'T>)
-        (onNext: 'T -> unit)
-        : Subscription =
-
-        Hopac.run <|
-            subscribeJob
-                source
-                (fun x -> job { onNext x })
-                (fun e -> job { raise e })
-                (fun () -> Job.unit ())
-
-module TaskInterop =
-
-    open Hopac.Extensions
-
-    /// Cold, cancellable Task boundary.
-    ///
-    /// The Task is created at subscription time.
-    /// Cancellation is exposed to the factory via CancellationToken.
-    let ofTaskFactory
-        (makeTask: CancellationToken -> Task<'T>)
-        : AsyncObservable<'T> =
-
-        fun ctx obs -> job {
-            let linked =
-                CancellationTokenSource.CreateLinkedTokenSource(CancellationToken.None)
-
-            try
-                try
-                    let task =
-                        makeTask linked.Token
-
-                    // Bridge task completion into an IVar so it can be raced against
-                    // Stop as an Alt. The bridge observes the task's outcome (success
-                    // or fault), so a cancelled task never raises unobserved.
-                    let outcome = IVar<Choice<'T, exn>>()
-
-                    do!
-                        Job.start <| job {
-                            try
-                                let! x = Job.awaitTask task
-                                do! IVar.fill outcome (Choice1Of2 x)
-                            with e ->
-                                do! IVar.fill outcome (Choice2Of2 e)
-                        }
-
-                    let! winner =
-                        (ctx.Stop ^-> fun () -> Choice2Of2 ())
-                        <|>
-                        (IVar.read outcome ^-> Choice1Of2)
-
-                    match winner with
-                    | Choice2Of2 () ->
-                        // Subscription stopped: cancel the task and terminate silently.
-                        // Disposal happens in the finally, after Cancel, so the bridge
-                        // (which never touches `linked`) cannot race a disposed CTS.
-                        linked.Cancel()
-
-                    | Choice1Of2 (Choice1Of2 x) ->
-                        if not (ctx.IsStopped()) then
-                            do! obs.OnNext x
-                            do! Internal.runUnlessStopped ctx (obs.OnCompleted())
-
-                    | Choice1Of2 (Choice2Of2 e) ->
-                        // A genuine task fault/cancellation (subscription not stopped).
-                        // `Job.awaitTask` surfaces a faulted Task as its wrapping
-                        // AggregateException; unwrap a single inner exception so the
-                        // underlying fault/message surfaces instead of the wrapper.
-                        let unwrapped =
-                            match e with
-                            | :? AggregateException as agg when agg.InnerExceptions.Count = 1 ->
-                                agg.InnerExceptions.[0]
-                            | _ -> e
-
-                        let err =
-                            match unwrapped with
-                            | :? OperationCanceledException ->
-                                OperationCanceledException("Task was cancelled.") :> exn
-                            | _ -> unwrapped
-
-                        do! Internal.runUnlessStopped ctx (obs.OnError err)
-                with e ->
-                    do! Internal.runUnlessStopped ctx (obs.OnError e)
-            finally
-                linked.Dispose()
-        }
-
-    /// Cold Task boundary without a useful CancellationToken.
-    let ofTask (makeTask: unit -> Task<'T>) : AsyncObservable<'T> =
-        ofTaskFactory (fun _ -> makeTask())
-
-    /// Hot/eager Task boundary. Use only when the Task intentionally already exists.
-    let ofHotTask (task: Task<'T>) : AsyncObservable<'T> =
-        ofTask (fun () -> task)
-
-    let toTaskList (source: AsyncObservable<'T>) : Task<'T list> =
-        let results = ResizeArray<'T>()
-
-        Hopac.startAsTask <| job {
-            do!
-                Subscribe.runJob
-                    source
-                    (fun x -> job { results.Add x })
-                    (fun e -> job { raise e })
-                    (fun () -> Job.unit ())
-
-            return List.ofSeq results
-        }
-
-module AsyncRx =
-
-    open AsyncRxCE
-
-    let asyncRx =
-        AsyncRxCE.asyncRx
-
-    let value x =
-        AsyncObservable.singleton x
-
-    let empty<'T> =
-        AsyncObservable.empty<'T>
-
-    let never<'T> =
-        AsyncObservable.never<'T>
-
-    let fail<'T> e =
-        AsyncObservable.fail<'T> e
-
-    let ofSeq xs =
-        AsyncObservable.ofSeq xs
-
-    let interval ms =
-        AsyncObservable.intervalMillis ms
-
-    let map f xs =
-        AsyncObservable.map f xs
-
-    let mapJob f xs =
-        AsyncObservable.mapJob f xs
-
-    let filter f xs =
-        AsyncObservable.filter f xs
-
-    let choose f xs =
-        AsyncObservable.choose f xs
-
-    let take n xs =
-        AsyncObservable.take n xs
-
-    let scan f init xs =
-        AsyncObservable.scan f init xs
-
-    let debounce ms xs =
-        AsyncObservable.debounce ms xs
-
-    let switchLatest xs =
-        AsyncObservable.switchLatest xs
-
-    let switch xs =
-        AsyncObservable.switchLatest xs
-
-    let merge xs =
-        Merge.merge xs
-
-    let amb xs =
-        Choice.amb xs
-
-    let race xs =
-        Choice.amb xs
-
-    let zip a b =
-        AsyncObservable.zip a b
-
-    let bothOnce a b =
-        AsyncObservable.bothOnce a b
-
-    let orElse a b =
-        Choice.orElse a b
-
-    let case source chooser =
-        AsyncObservable.choose chooser source
-
-    let first source =
-        AsyncObservable.first source
-
-    let firstWhere pred source =
-        AsyncObservable.firstWhere pred source
+let clauses =
+    AsyncObservable.ClausesBuilder()
