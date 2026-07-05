@@ -123,13 +123,27 @@ cellFahrenheit.AddDependency (cellCelsius.Cell, fun c -> (c * 9./5.) + 32.)   //
 cellCelsius.AddDependency (cellFahrenheit.Cell, fun f -> (f - 32.) * 5./9.)   // f → c
 ```
 
-Two features betray that this is a *cycle being forced to converge*:
+Two features *look* like they damp the cycle, but **neither is what makes the shipped demo
+converge** (verified empirically, 2026-06-22, fsi + Adaptive 1.2.16):
 
-- **A circuit breaker** ([`constraintprop.fsx:221`](../constraintprop.fsx)) trips when
-  updates exceed a threshold within a one-second window — because a bidirectional
-  constraint can oscillate forever.
-- **`coarsen` / `isEqual`** ([`constraintprop.fsx:200`](../constraintprop.fsx)) round
-  values for comparison, so a floating-point cycle has a fixpoint it can actually reach.
+- **A circuit breaker** ([`constraintprop.fsx:221`](../constraintprop.fsx)) trips after ~50
+  updates in a one-second window. It is a *safety net*, not a convergence mechanism: on the
+  C↔F demo it never fires (the cycle settles in ~6 writes), and when it *does* fire — give the
+  cells non-inverse transforms — it writes an **error** into the cell. A failure state, not a
+  converged value.
+- **`coarsen` / `isEqual`** ([`constraintprop.fsx:200`](../constraintprop.fsx)) are **inert on
+  this path.** They are consulted only by the default `minimize`, and a single-dependency cell
+  never calls `minimize` (the `runMinimize` tail is empty). Running the demo with `coarsen` vs.
+  without gives byte-identical behaviour.
+
+What actually makes it converge lives *outside* the cell's machinery: (1) F# Adaptive's
+change-detection on `Result<float,string>` is **structural** — re-writing `Ok v` over an equal
+`Ok v` does not re-fire — so propagation halts at a fixpoint; and (2) the C→F and F→C
+transforms are **exact mutual inverses on IEEE doubles** (`c2f (f2c f) = f` bit-for-bit), so
+that fixpoint is reached in a single round-trip. Break either fact — a lossy transform, or a
+value type Adaptive compares by reference — and the cycle oscillates into the breaker instead.
+Gen-1 converges on *this* C↔F because the arithmetic is an exact involution, not because the
+cell damps anything.
 
 `Cell2` is recognizably the *same* engine — same `ResizeArray`, same per-dependency
 callback, same `runMinimize` — grown up with structured `CellError<'T>` errors
@@ -199,9 +213,11 @@ cannot do C↔F**.
 
 ### Trace: setting Celsius to 100 on the fold engine
 
-The temperature cells at [`constraintprop2.fsx:634`](../constraintprop2.fsx) are built on
-the **fold engine** — and built with `logErrors = true`, a fossil of this exact failure.
-The default `minimize` is **equality** ([`constraintprop2.fsx:295`](../constraintprop2.fsx)):
+The shipped temperature demo at [`constraintprop2.fsx:633`](../constraintprop2.fsx) is built on
+`Cell2` (the propagator engine), `logErrors = true`. The trace below instead exercises the
+**fold engine** — the same two cells built on `Cell` ([@255](../constraintprop2.fsx)) — because
+that is the engine whose narrowing-only limit we are isolating. Its default `minimize` is
+**equality** ([`constraintprop2.fsx:295`](../constraintprop2.fsx)):
 
 ```fsharp
 defaultArg minimize (fun a b -> if isEqual a b then Ok a else Error "Default minimize: values are not equal")
@@ -216,7 +232,7 @@ Now set `cellCelsius.Value <- Some 100` (its seed was `initial = 0`):
 `cellCelsius` flips to an error the instant it is set to anything other than its seed. The
 conversion never happens. The fold engine can only ever **narrow**; it cannot transform.
 
-**Receipts (from the REPL).** Running the temperature demo confirms this exactly. The
+**Receipts (from the REPL).** Running these cells on the fold engine confirms this exactly. The
 cleanest evidence is the *self-conflict* — it needs no second cell at all:
 
 ```text
@@ -269,8 +285,9 @@ Equality-on-floats is not a meet and `0` is not a top, so C↔F collapses.
      cell's own value is not in the meet
      ([`constraintprop.fsx:278`](../constraintprop.fsx)). With one external dep per
      direction, `runMinimize [transform]` simply *is* the transform, so setting C
-     overwrites F. Directional push → C↔F **works** (circuit breaker + `coarsen` damp the
-     cycle).
+     overwrites F. Directional push → C↔F **works** (it terminates on Adaptive's structural
+     value-equality once the exact-inverse round-trip hits a fixpoint — *not* via `coarsen` or
+     the breaker; see the "Two features" note above).
 
 So: **C↔F is closer to propagators** (paired directional agents, functional push), and
 **Sudoku is constraint propagation** (global meet, monotone domain narrowing).
@@ -321,14 +338,20 @@ payload's type. The two files differ in exactly that payload, and that is the wh
 
 The value actually being compared is `InconsistencyConflict("", "…")` — only `string` fields
 — so this is *not* a "can't compare a `'T` / `'T list` field" problem; it is a null reference
-being walked. The most likely null is the map node's previous-value cache, which for a
-reference-typed output (`Result<_, CellError>`) starts life as `Unchecked.defaultof = null`.
-The original engine never tripped it because `float` / `string` / `float option` all take the
-comparer's safe path.
+being walked inside the comparer. **Empirically (2026-06-22) the crash is specific to F#
+*discriminated unions* on the error arm, not reference types in general:** a plain reference
+record `{ Code:int; Msg:string }` in the same `Result<_, _>` position does *not* trip it — only
+the DU does. `ShallowEqualityComparer` runs its own structural *union* walk (it does **not**
+consult `Equals`/`IEquatable`), and that walk dereferences a null in the union path. The
+original engine never tripped it because `float` / `string` / `float option` all take the
+comparer's safe value-type/string path.
 
-> *Which operand is null is inference from the stack; the channel-type split — `string`
-> survives, the DU crashes — is certain. It can be pinned down by decompiling
-> `ShallowEqualityComparer` in the FSharp.Data.Adaptive 1.2.16 package.*
+> *The channel-type split — `string` (indeed any value type, and even a plain reference
+> **record**) survives; the **DU** crashes — is confirmed empirically on FSharp.Data.Adaptive
+> 1.2.16 with a minimal repro: `cval (Ok 0.0 : Result<float, CellError<float>>) |> AVal.map id`,
+> driven `Error → Error`, throws with the exact `shallowEquals(CellError) ←
+> shallowEquals(FSharpResult)` stack — no `Cell`, cycle, or `transact` re-entrancy needed. The
+> precise null operand inside the union walk remains internal to the library.*
 
 **The irony.** This is the *upgrade* biting back. `constraintprop.fsx` converges on C↔F
 precisely *because* its errors are dumb strings. Replacing them with a structured,
@@ -337,10 +360,17 @@ better — is what makes both Gen-2 cells incompatible with the adaptive graph's
 fast-path. The fold engine hits *both* walls (wrong paradigm **and** this NRE); `Cell2` has
 only this one standing between it and a working C↔F.
 
-**This is a library/type bug, not a propagation bug.** The fix space is "keep the error
-channel shallow-comparable" — primitive/value-type error codes, or give `CellError` a custom
-`IEquatable`/equality so F# Adaptive never structurally walks it — nothing in the propagation
-logic. (Out of scope here: flagged, not fixed.)
+**This is a library/type bug, not a propagation bug** — and the fix space is narrower than
+"keep it shallow-comparable" implies (each checked empirically, 2026-06-22):
+
+- ✅ **value-type error code** — `int`, or a `[<Struct>]` record. Safe.
+- ✅ **plain reference *record*** (`{ Code:int; Msg:string }`). Safe — the bug is DU-specific.
+- ❌ **custom `IEquatable` / `override Equals` on the DU.** Does **not** help: `ShallowEqualityComparer`
+  never calls it and still walks the union. *(Previously suggested as a fix here; that was wrong.)*
+- ✅ keep errors out of the value channel entirely (⊥ as a sentinel — the route the design
+  journal's kernel takes, D5).
+
+Nothing here touches propagation logic. (Out of scope for this post-mortem: flagged, not fixed.)
 
 ---
 
@@ -451,11 +481,16 @@ if the real history ran the other way.
 - **Propagators (callback `Cell` / `Cell2`)** handle *directional and bidirectional
   functional relationships* — conversions, linear systems — by pushing values around a
   network of independent agents, and (in `Cell2`) can validate an assignment against
-  constraints before accepting it. The cost is the eager re-collect-on-change loop and a
-  heavier reliance on the breaker and coarsening to converge. **Caveat:** only the
-  `constraintprop.fsx` version converges on C↔F today, but that does
-  not make it a success: it still cannot do narrowing. `Cell2` carries the right design but
-  `NRE`s on C↔F until its `CellError` channel is made shallow-comparable.
+  constraints before accepting it. The cost is the eager re-collect-on-change loop, and
+  reliance on **Adaptive's own value-equality reaching a fixpoint** to halt: Gen-1 has no
+  compare-before-set guard, so it re-writes the cell on every fire and stops only when the
+  recomputed value is bit-equal to the cached one. (`Cell2` *does* add an `isEqual`-gated
+  compare-before-set at [`constraintprop2.fsx:609`](../constraintprop2.fsx) — the one place
+  `coarsen`/`isEqual` actually become load-bearing — but it `NRE`s on C↔F anyway.) The circuit
+  breaker is a divergence guard, not a convergence aid. **Caveat:** only the
+  `constraintprop.fsx` version converges on C↔F today, and only because its transforms are
+  exact inverses; it still cannot do narrowing. `Cell2` carries the right design but `NRE`s on
+  C↔F until its `CellError` channel is made shallow-comparable (the fix table above).
 
 **One-line arc:** the project started with a hand-rolled propagator network (directional
 agents, C↔F), and later forked off a declarative constraint-propagation engine (global meet,
