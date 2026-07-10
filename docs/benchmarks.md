@@ -62,6 +62,60 @@ The `uint16` speedup (**14.74×**) is much larger than the `Set` speedup (**6.22
 
 > Cross-run note: this run's *baseline* numbers (Set 5334.6 / bit 1872.1 best µs) differ from the 2026-06-23 row (6968.5 / 1746.9) — a different session under the same throttle, exactly why we never compare across runs. The trustworthy comparison is M-vs-baseline measured **in the same process**, above.
 
+---
+
+## 2026-07-03 — WFC store + tiled adjacency propagator, first 500×500 measurements
+
+- **Source:** [propagator-wfc.fsx](../propagator-wfc.fsx) — the specialized WFC store (work items 1+2 of [mutable-core-plan.md](mutable-core-plan.md)): cell-major multiword bitset store (runtime `W = ⌈tiles/64⌉`), worklist of cell ids, adjacency propagator `B ∩= ⋁_{t∈A} allowed[t][dir]`, ⊥ early-exit in quiescence.
+- **Scenario:** 500×500 grid (250k cells). Each run = `Reset` (refill ⊤) + one `Assert` + propagate to quiescence. Ramp tileset (`|a−b| ≤ 1`): a corner/center pin launches a dense-⊤ wave — the **worst case** for the union loop (cost ∝ popcount of the firing cell); gravity tileset (T=2): a bottom pin forces one 499-cell column — the local-wave case. **No baseline row exists** (nothing prior does WFC); these are first measurements to compare future variants against *in-process*.
+- **Runtime:** .NET 9.0.12, `dotnet fsi`, optimizations **OFF** (fsi default)
+- **Machine:** Intel Core i7-8750H (Coffee Lake), throttled to 65% — absolute ms run low/variable; treat rows as first anchors, not truth
+- **Harness:** best-of-3 trials × per-row iters (1–20), small warmup, `GC.Collect` between trials; all rows in **one process**
+- **Correctness:** verified before timing — ramp closed-form domains (incl. the 64-bit word seam at T=100), OR-on-narrow supports, assert-site ⊥, mid-propagation ⊥ with early-exit + clean worklist + `Reset` reuse, direction-asymmetric gravity wiring; plus 500×500 spot checks per bench engine. The harness refuses to time a wrong engine.
+- **Commit:** `6c7969b` + the new (untracked) `propagator-wfc.fsx`
+
+| row | T (tiles) | W | cells narrowed | best ms/run | mean ms/run |
+|-----|----------:|--:|---------------:|------------:|------------:|
+| reset-only        | 512 | 8 | — (refill 2M words)  |    6.7 |    7.7 |
+| ramp512 corner    | 512 | 8 | ~131k, dense domains | 5324.7 | 5684.7 |
+| ramp128 center    | 128 | 2 | ~32k, dense domains  |  134.1 |  138.0 |
+| reset-only        |   2 | 1 | — (refill 250k words)|    1.8 |    2.2 |
+| gravity column    |   2 | 1 | 499 (one column)     |    1.9 |    2.0 |
+
+**Reading.** The engine's cost is proportional to the **wave**, not the grid: the gravity row minus its reset-only row puts a 499-cell forced column at **~0.12 ms** — the locality that interactive editing (work item 5) banks on. The ramp rows are the deliberate dense-⊤ worst case: every firing cell still carries hundreds of live tiles, so the per-fire union loop does `popcount × W` word-ORs, and at T=512 that compounds to ~5.3 s for the 131k-cell wave (~1.4G word-ORs under fsi optimize-off). Real WFC firing cells are near-collapsed (the plan's "cheap when A is near-collapsed"), so driver-era numbers should sit far below the ramp rows — but if dense-domain waves show up hot once the min-entropy driver (item 4) runs, this is the trigger the plan set for benchmarking the **AC-4 support-counter** fallback, in-process against these same scenarios.
+
+## 2026-07-03 (second run) — trail + search driver: first full-map generations
+
+- **Source:** [propagator-wfc.fsx](../propagator-wfc.fsx) — items 3+4 of [mutable-core-plan.md](mutable-core-plan.md): engine grew the trail (journal `(cell, oldWords, oldSupport)` per narrow, `Mark`/`UndoTo`, premise-free `Collapse`, `OnChange` hook); search driver = `module WfcSearch` on **Hansei.TreeSearch** (`#r Hansei.Core.dll`) — lazy-LazyList list-of-successes, min-entropy via a validate-on-pop binary heap subscribed to `OnChange`, seeded shuffle tile order.
+- **Scenario:** top group = the same store/propagator rows as the 2026-07-03 section, re-measured **in this process** (the engine now journals every narrow, so those rows include trail cost — compare them only against the generation rows below, never against the earlier section). Bottom group = full-map generation: `Reset` + heap rebuild + lazily force the FIRST solution (`LazyList.tryHead`), seeded rng ⇒ identical work per iteration, forcing on a big-stack thread.
+- **Runtime:** .NET 9.0.12, `dotnet fsi`, optimizations **OFF** (fsi default)
+- **Machine:** Intel Core i7-8750H (Coffee Lake), throttled to 65% — ratios are the signal
+- **Harness:** best-of-3 trials × per-row iters (1–20), warmup, `GC.Collect` between trials; all rows one process
+- **Correctness:** all 10 scenarios verified before timing — the items-1+2 five plus: trail snapshot-exact restore (words AND supports, nested marks, ⊥ unwind to a usable store), staircase 1×3/1×4 closed-form solution AND failure counts (1 sol + exactly 2 failed guesses / unsat + exactly 3), gravity 3×3 exhaustive = 4³ = 64 distinct valid solutions under the heap picker with exactly 0 failures (paths ⇒ AC complete), checkerboard 3×3 = 2, LazyList memoized re-force = same array reference. Generation spot-checked valid at full size before timing.
+- **Commit:** `6c7969b` + the untracked `propagator-wfc.fsx`
+
+| row | scenario | best ms/run | mean ms/run |
+|-----|----------|------------:|------------:|
+| reset-only W=8      | store refill, T=512               |    5.0 |    5.6 |
+| ramp512 corner      | dense-⊤ wave, ~131k cells         | 5213.7 | 5904.5 |
+| ramp128 center      | dense-⊤ wave, ~32k cells          |  151.4 |  168.6 |
+| reset-only W=1      | store refill, T=2                 |    2.2 |    2.5 |
+| gravity column      | 499-cell local wave               |    1.8 |    2.5 |
+| **gravity gen 500×500** | full map, T=2, ~few k guesses |  327.3 |  356.7 |
+| **3color gen 500×500**  | full map, T=3, ~250k guesses  | 44173.2 | 47269.1 |
+| **ramp32 gen 64×64**    | full map, T=32, 4k cells      |  108.1 |  132.5 |
+
+**Reading.** A full 500×500 gravity map generates in ~0.33 s — collapse waves force whole column
+segments, so only a few thousand guesses happen and the row is dominated by `Reset` + the 250k-push
+heap rebuild. The 3-color row is the driver-overhead anchor: nothing forces cells (every collapse
+narrows neighbors to entropy 2, still undecided), so ~250k genuine guesses run at **~180 µs/guess**
+under fsi optimize-off — that cost is driver-side (heap churn: one push per narrow + validate-on-pop;
+LazyList/CE node allocation per guess), NOT engine waves, and it's the row to beat if the driver ever
+needs tightening. Failed guesses were 0 on all three generation tilesets (AC-friendly rules; the
+staircase tests cover the unwind path with exact counts), and the dense-⊤ AC-4 trigger never fired
+during generation — firing cells are near-collapsed once the driver is placing tiles, as the plan
+predicted.
+
 <!-- Template for the next run — copy the section above, update the env block, add rows.
 ## YYYY-MM-DD — <what changed>
 - **Source:** …

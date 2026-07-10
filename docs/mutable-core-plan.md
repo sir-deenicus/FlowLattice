@@ -217,17 +217,64 @@ Godot + AsyncRx streaming is the *target*, not a tracked build step — dropped 
 1. **Bit-plane SoA store** — `W = ⌈tiles/64⌉` planes of `uint64[nCells]`, runtime `W`; meet = AND/plane,
    `isBot` = all-planes-zero, entropy = Σ popcount. New specialized store (generic `'a[]` can't hold a
    runtime-width multiword value).
+   **BUILT + verified 2026-07-03** as [propagator-wfc.fsx](../propagator-wfc.fsx), with one as-built
+   delta: the store is **cell-major** (one flat `uint64[nCells*W]`, a cell's `W` words contiguous), not
+   plane-major — same laws, same no-per-cell-heap point, but the hot path touches all `W` words of two
+   cells per fire (1–2 cache lines cell-major vs `W` scattered lines plane-major), and no whole-grid
+   single-plane pass exists to favor planes. `⊤` masks off the last word's bits ≥ `nTiles`.
 2. **Tiled adjacency propagator** — `allowed[tile][dir]` bitsets, `B ∩= ⋁_{t∈A} allowed[t][dir]`, looped
    over planes. AC-4 counters as benchmarked fallback.
+   **BUILT + verified 2026-07-03** in the same file. As-built deltas: (a) the propagator is **not a
+   closure** — the worklist holds **cell ids** and firing a cell pushes into its ≤4 structural neighbors
+   (avoids ~1M closure allocations at 500×500, and every edge's write-side is structurally known — which
+   item 5 needs anyway); (b) the item-4 **⊥ early-exit** (abort quiescence on an emptied cell, drain
+   queue + unset `queued[]` flags) is pulled forward into this file — the machinery is shared with the
+   item-3 trail unwind, and without it a ⊥ avalanches ∅ across the grid even in small demos. Verified:
+   ramp closed-form domains across the 64-bit word seam, OR-on-narrow supports, assert-site ⊥,
+   mid-propagation ⊥ (early-exit + clean worklist + `Reset` reuse), direction-asymmetric gravity rule.
+   First 500×500 timings in [benchmarks.md](benchmarks.md) (2026-07-03): cost ∝ wave, not grid — a
+   499-cell column forces in ~0.12 ms; the dense-⊤ ramp waves are the union loop's worst case (T=512
+   corner pin ≈ 5.3 s for ~131k dense cells under fsi optimize-off) — the AC-4 trigger to watch once the
+   driver runs, since real firing cells are near-collapsed.
 3. **Trail** — journal `(cell, value, support)` on each narrow, marks at choice points, LIFO unwind +
    clear worklist — the queue AND the `queued[]` dedup flags (see the backtracking bullet above for both
    corrections).
+   **BUILT + verified 2026-07-03 (second pass)** in [propagator-wfc.fsx](../propagator-wfc.fsx). As built:
+   the journal is engine-side MECHANISM only — struct-of-arrays with doubling (`tCell`/`tSup`/`tWords`, no
+   per-entry allocation), written by `meetInto` before the support OR; `Mark`/`UndoTo` restore BOTH fields
+   LIFO + drain queue + clear `queued[]` + clear the contradiction, landing on the pre-mark quiescent
+   fixpoint with no re-propagation. Two additions beyond the spec, both mechanism: a premise-free
+   `Collapse(cell, tile)` (search never spends a premise bit; authored provenance still flows through the
+   wave) and an `OnChange` observation hook fired on every narrow AND every undo-restore — the engine's
+   entire contribution to selection policy. Verified by snapshot equality (words AND supports), nested
+   marks, ⊥ unwind to a usable store, and post-unwind propagation (no dead dedup flags).
 4. **Search driver** — min-entropy via popcount over a bucketed/indexed PQ (not an O(n²) scan); collapse →
    propagate → on ⊥ unwind + exclude the tried tile + retry. **Needs ⊥ early-exit in propagation**
    (2026-07-03): `quiesce` today runs the queue dry regardless; in WFC a ⊥ cell propagates ∅ outward and
    avalanches the whole grid before control returns to the driver. Abort quiescence when `emit` meets to
    `isBot` (the lattice already carries `isBot`; it is unused on the hot path) — the abort reuses the same
    drain-queue + clear-flags machinery as the unwind.
+   **BUILT + verified 2026-07-03 (second pass)**, same file, as `module WfcSearch` — POLICY, deliberately
+   outside the engine: the engine's whole search surface is `Mark`/`UndoTo`/`Collapse` + `OnChange`, and
+   selection, tile ordering, and retry are all replaceable without touching `module Wfc`. As-built deltas:
+   (a) the search monad is **Hansei.TreeSearch** (`#r Hansei.Core.dll`, external asset): `guard` = an
+   if-check returning empty on fail, so a failed collapse contributes nothing and the enumeration IS the
+   backtracking — `Exhaustive` (the list monad) for all-solutions, `TreeSearch.LazyList` for lazy
+   first-success generation. LazyList's cells are MEMOIZED: node effects run at most once, re-forcing a
+   prefix is safe (a raw seq would re-run collapses); unforced tails still assume the engine is where DFS
+   left it. Both strategies are strictly depth-first, which is what keeps the mark/undo bracket coherent
+   on ONE mutable store — the fair/interleaving `Hansei.Backtracking` stream resumes branches out of LIFO
+   order and waits for the step-3 persistent store. (b) The PQ is a **lazy binary min-heap** over packed
+   `(entropy <<< 32 ||| cell)` keys subscribed to `OnChange`, validate-on-pop (discard decided, reinsert
+   stale at true entropy) — not bucketed; the invariant "every undecided cell has a live entry" holds
+   because every entropy transition (narrow or undo-restore) pushes one. (c) The ⊥ early-exit was already
+   pulled forward into items 1+2. (d) Deep maps run the forcing on a **big-stack thread** (frames ∝
+   guesses, not cells) — a cost of list-of-successes on a mutable store; the persistent variant removes
+   it. Verified: staircase 1×3/1×4 closed-form solution AND failure counts (1 sol + exactly 2 failed
+   guesses; unsat + exactly 3), gravity 3×3 = 4³ = 64 distinct valid solutions under the heap picker with
+   exactly 0 failures (columns are paths ⇒ AC complete ⇒ zero backtracks — a sharp differential), 
+   checkerboard 3×3 = 2, and LazyList first-solution valid + re-force returns the same array reference.
+   Full-map generation timings (500×500 gravity/3-color, 64×64 ramp) in [benchmarks.md](benchmarks.md).
 5. **Cone-local `Retract`** — replace the step-1 replay-ALL with reset-cone + re-fire only the propagators
    incident to the cone (the interactive-edit layer). **Incident = props that read OR WRITE a cone cell**
    (2026-07-03): the writers are the re-derivers — a reset cell is never re-narrowed by its readers plus
@@ -241,3 +288,111 @@ Godot + AsyncRx streaming is the *target*, not a tracked build step — dropped 
 Order: 1 → 2 → (verify on a small grid) → 3 + 4 (generation works end-to-end) → 5 (authored edits).
 Benchmark at 500×500 along the way. The earlier micro-opts (#4 emit read, #5 preallocation) stay noise at
 this scale — skip.
+
+### Item 5 work order — cone-local `Retract` (2026-07-03, delegated build)
+
+Self-contained brief for the executing agent. The design judgment is already spent — where this brief
+locks a decision, implement it as written rather than re-deriving it. The item-5 entry above is the spec;
+this section adds the decisions it left open and the verification/benchmark contract.
+
+**Scope.** One file: [propagator-wfc.fsx](../propagator-wfc.fsx) (repo root; `dotnet fsi propagator-wfc.fsx`
+must exit 0 with all verifications PASS). The file has **no `Retract` today** — you build the cone-local one
+directly; there is no replay-ALL legacy here to modify. The step-1 replay-ALL lives in
+`propagator-mutable-core.fsx` — read it for the laws if useful, but do **not** port its re-meld-into-ALL-cells
+step (that is exactly the provenance-pollution trap named above). Engine surface as it stands:
+`Assert(premise, cell, mask)` / `AssertTile` (premise 0..63 → support bit `1UL <<< premise`, meet + quiesce),
+premise-free `Collapse` (search spends no premise — keep it that way), trail `Mark`/`UndoTo`, `OnChange`
+fired on every domain change, `Reset`, and the ⊥ early-exit with drain-queue + clear-`queued[]` machinery.
+
+**What to build — three pieces:**
+
+1. **Authored-assert registry.** `Assert` currently records nothing, so there is nothing to replay or
+   survive. Record `(premise, cell, Array.copy mask)` in a `ResizeArray` **iff the assert is actually
+   applied** — an `Assert` rejected because the store is already contradicted returns `false` and must NOT
+   be recorded (the editor saw it refused; recording it would make oracle replay diverge from the live
+   store). An assert that itself causes ⊥ IS recorded — retracting it is how the editor fixes the ⊥.
+   Multiple asserts may share one premise (one paint stroke = one premise, many cells); `Retract p` removes
+   them all. `Reset` clears the registry.
+
+2. **⊥-abort pending set.** When `quiesce` ⊥-aborts, it currently drains the queue and unsets flags —
+   losing the ids of cells that were narrowed but never fired. Those cells make the store **non-quiescent
+   outside any cone** (their support need not contain the culprit premise — e.g. premise q's half-propagated
+   wave dies on a ⊥ caused by premise p's earlier narrowings), and cone-local retract assumes the non-cone
+   region is at fixpoint. So: on ⊥-abort, record the drained ids into a `pendingBot: ResizeArray<int>`
+   (queue dedup guarantees uniqueness) instead of discarding them. `pendingBot` is cleared by `Reset` and by
+   `UndoTo` (the restored pre-mark fixpoint makes it void — search ⊥s populate it too, harmlessly), and
+   consumed by `Retract`.
+
+3. **`member Retract (premise: int) : bool`** (true = store uncontradicted after, matching
+   `Assert`/`Collapse`). Steps, in order:
+   a. Remove all registry entries tagged `premise`.
+   b. Cone scan: `cone = { c | supports.[c] &&& bit <> 0UL }` — a straight O(nCells) pass over `supports`
+      (250k reads is well inside an edit-latency budget; a premise→cells index is a later optimization
+      only if the benchmark says so).
+   c. If `botCell ≥ 0` and the bot cell is in the cone, clear `botCell` (the culprit is being retracted).
+      If the bot cell is NOT in the cone, leave it — the contradiction doesn't depend on this premise; the
+      retract still runs, the store stays contradicted, and `quiesce` will immediately re-abort and re-drain
+      into `pendingBot` (consistent, still-⊥ state awaiting a retract of an actual culprit).
+   d. Reset every cone cell: words ← `topWord`, support ← `0UL`, and fire `onChange` (the entropy heap's
+      invariant needs a push on widening too; its validate-on-pop already tolerates entropy increases).
+      These resets are direct writes — NOT journaled.
+   e. Re-meld surviving registry entries **whose target cell is in the cone** (`meetInto target mask
+      (1UL <<< theirPremise)`). Cone-only — melding into non-cone cells is the step-1 pollution trap.
+   f. Enqueue the re-derivation frontier: every cone cell AND every structural neighbor of a cone cell
+      (`enqueue` dedups). Neighbors are the WRITERS into reset cells — readers-only never re-narrows a
+      reset cell (spec entry above); cone cells themselves must also fire because even a ⊤ cell's
+      allowed-union can constrain a neighbor. Also enqueue everything in `pendingBot`, then clear it.
+   g. `quiesce ()` — may legitimately re-⊥ (other culprits remain).
+   h. `tLen <- 0`. Precondition (document it on the member): `Retract` is an editor-level operation, never
+      called with an outstanding search mark. Re-derivation journals its narrows via `meetInto` (harmless),
+      but the cone resets in (d) are not journaled, so any surviving mark would be corrupt — truncating the
+      trail makes crossing an authored edit with `UndoTo` impossible by construction.
+
+**The correctness oracle — differential vs full replay, with one deliberate asymmetry.** Implement a
+reference retract for tests: same registry removal, then full reset (all cells ⊤, supports 0, `botCell` −1,
+worklist and `pendingBot` clear), then replay every surviving registry entry in insertion order
+(meet + quiesce each). Run it on a **twin engine** (second instance, same parameters) so the live engine's
+state survives the comparison. Comparison rule:
+
+- If either store is contradicted: compare the `Contradiction` FLAG only (both must agree). An aborted
+  store is an intentionally non-quiescent early-exit state and its cell contents are order-dependent by
+  design; the two ⊥ sites may even differ.
+- Otherwise: **values exactly equal** (full `words` comparison), both worklists clean, and two semantic
+  support checks — the retracted bit appears in NO support, and every support mask ⊆ the OR of surviving
+  premises' bits.
+- **Do NOT demand exact support-mask equality.** OR-on-narrow attribution is order-dependent among
+  confluent waves: whichever wave narrows a cell first gets the credit, and cone-local re-derivation
+  processes a different order than from-scratch replay. Both masks are sound over-approximations of the
+  true dependency set; a mismatch is not a bug. If you see one and are tempted to "fix" it by changing
+  when supports are ORed, stop — that breaks the OR-on-narrow law. Soundness (never too SMALL a support)
+  is what the compositional test below actually pins down: a too-small support makes a later cone miss
+  cells, and the VALUE comparison after that later retract fails.
+
+**Verification (all before any timing; the existing verifications must still pass unchanged):**
+
+- Hand-built cases on small grids: retract one of two pins → values equal oracle; overlapping cones (two
+  premises whose waves narrow shared cells) → retract either, values equal oracle, retracted bit gone;
+  retract-the-culprit after a mid-wave ⊥ → contradiction cleared, values equal oracle (this exercises
+  `pendingBot`); retract a NON-culprit on a ⊥ store → still contradicted, then retract the culprit → clean
+  and equal; empty-cone retract (assert refused or already undone) → near-no-op, registry shrinks.
+- The workhorse: **randomized compositional differential.** Seeded RNG, small grids (e.g. 6×6 gravity T=4
+  and 5×5 3-color), ~200 ops per run: random `Assert` (premise from a free pool) / `Retract` (random live
+  premise, returned to pool), interleaved, ⊥ states included and continued through. After EVERY op, replay
+  the surviving registry on the twin and apply the comparison rule. This catches everything the named traps
+  describe, compositionally.
+- Post-retract usability: after a retract, further `Assert` and a `Collapse`-driven search still behave
+  (worklist clean, no dead flags).
+
+**Benchmark (after verification passes, one process, appended as a new dated section of
+[benchmarks.md](benchmarks.md) with the standard env block; fsi optimize-off numbers are ratios, not
+absolutes — never compare across runs):** at 500×500, head-to-head cone-local vs the twin-replay reference
+on the SAME edit: (a) small cone — gravity, two column pins, retract one (cone ≈ one column); (b) large
+cone — a pin whose wave narrowed a big fraction of the grid (the honest degenerate case where cone-local ≈
+full replay). Best-of-3 trials, iteration counts sized like the existing harness in `main`. The ratio on
+(a) is the number that justifies this item.
+
+**Deliverables:** the modified fsx (verifications gate timing, exit 0); the benchmarks.md section; a
+**BUILT + verified** block appended to item 5 above in the style of items 1–4, recording as-built deltas
+(the pending set, the oracle's flag-only-⊥ and no-exact-support-equality rules, and anything you had to
+decide beyond this brief). Conventions in force: no questions in any doc; match the file's existing idiom
+(qualified calls, no `[<AutoOpen>]`, comment density as-is); verify before timing, always.
