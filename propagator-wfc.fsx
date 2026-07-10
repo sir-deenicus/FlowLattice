@@ -25,10 +25,9 @@
 // list of successes). Min-entropy selection, tile ordering, and the entropy heap are all
 // driver-side; the engine never learns what a "guess" is.
 //
-// NOT here yet (later item): cone-local Retract (5). There is no Retract in this file at
-// all — the step-5 cone-local design replaces the step-1 replay-ALL, so building the
-// throwaway version here would be churn. Supports (uint64 premise masks, OR-on-narrow)
-// ARE tracked: the trail journals them and provenance is the point of keeping them.
+// Item 5 (2026-07-05): cone-local Retract for authored edits. Authored asserts are
+// registered for replay, bot-aborted work is preserved in pendingBot, and Retract resets
+// only the support cone then re-fires the cone plus structural neighbors.
 //
 // Verified on hand-computable grids BEFORE timing (refuses to time a wrong engine); first
 // 500x500 timings are recorded in docs/benchmarks.md (not inline — they would rot).
@@ -69,6 +68,8 @@ module Wfc =
                     if rule d a b <> rule ((d + 2) % 4) b a then ok <- false
         ok
 
+    type AuthoredAssert = { Premise: int; Cell: int; Mask: uint64[] }
+
     /// The specialized WFC store + propagator. Same laws as module M in
     /// propagator-mutable-core.fsx (meet-only descent, OR-on-narrow supports, worklist to
     /// quiescence), different machinery: the value rep is W words per cell in one flat array,
@@ -89,6 +90,8 @@ module Wfc =
         let supports = Array.zeroCreate<uint64> nCells             // premise bitmask per cell
         let queued   = Array.zeroCreate<bool> nCells               // worklist dedup flag
         let q        = Queue<int>()                                // cells whose narrowing is unpushed
+        let pendingBot = ResizeArray<int>()                        // bot-aborted cells to re-fire after culprit retract
+        let authored = ResizeArray<AuthoredAssert>()               // accepted editor assertions, replayed by Retract
         let scratch  = Array.zeroCreate<uint64> nWords             // the union accumulator (single-threaded)
         let mutable botCell = -1                                   // -1 = no contradiction
 
@@ -137,6 +140,12 @@ module Wfc =
         let drainWorklist () =
             while q.Count > 0 do queued.[q.Dequeue()] <- false
 
+        let drainWorklistToPending () =
+            while q.Count > 0 do
+                let c = q.Dequeue()
+                queued.[c] <- false
+                pendingBot.Add c
+
         let enqueue (c: int) =
             if not queued.[c] then queued.[c] <- true; q.Enqueue c
 
@@ -157,7 +166,9 @@ module Wfc =
                 journal t
                 supports.[t] <- supports.[t] ||| s
                 onChange t
-                if alive = 0UL then botCell <- t else enqueue t
+                if alive = 0UL then
+                    if botCell < 0 then botCell <- t
+                else enqueue t
 
         // Push c's constraint into neighbor n through direction d: n ∩= ⋁_{t∈c} allowed[d][t].
         // Cost is proportional to c's popcount — cheap when c is near-collapsed (the common
@@ -186,7 +197,27 @@ module Wfc =
                 if botCell < 0 && col < width - 1  then push c 1 (c + 1)
                 if botCell < 0 && r < height - 1   then push c 2 (c + width)
                 if botCell < 0 && col > 0          then push c 3 (c - 1)
-            if botCell >= 0 then drainWorklist ()
+                if botCell >= 0 then pendingBot.Add c
+            if botCell >= 0 then drainWorklistToPending ()
+            else pendingBot.Clear ()
+
+        let removeAuthored (premise: int) =
+            let mutable write = 0
+            for read in 0 .. authored.Count - 1 do
+                let a = authored.[read]
+                if a.Premise <> premise then
+                    authored.[write] <- a
+                    write <- write + 1
+            if write < authored.Count then authored.RemoveRange(write, authored.Count - write)
+
+        let enqueueIncident (c: int) =
+            enqueue c
+            let r = c / width
+            let col = c % width
+            if r > 0 then enqueue (c - width)
+            if col < width - 1 then enqueue (c + 1)
+            if r < height - 1 then enqueue (c + width)
+            if col > 0 then enqueue (c - 1)
 
         member _.WordsPerCell = nWords
         member _.Contradiction = botCell >= 0
@@ -195,7 +226,12 @@ module Wfc =
         /// (empty queue, no stray dedup flags) whether it quiesced or ⊥-aborted.
         member _.WorklistClean = q.Count = 0 && Array.forall not queued
 
-        member _.Reset () = drainWorklist (); resetStore (); tLen <- 0
+        member _.Reset () =
+            drainWorklist ()
+            pendingBot.Clear ()
+            authored.Clear ()
+            resetStore ()
+            tLen <- 0
 
         member _.OnChange with set (f: int -> unit) = onChange <- f
 
@@ -208,6 +244,7 @@ module Wfc =
         /// pre-mark quiescent fixpoint: nothing needs re-propagation.
         member _.UndoTo (mark: int) =
             drainWorklist ()
+            pendingBot.Clear ()
             botCell <- -1
             while tLen > mark do
                 tLen <- tLen - 1
@@ -233,8 +270,43 @@ module Wfc =
         member _.Assert (premise: int, cell: int, mask: uint64[]) : bool =
             if premise < 0 || premise > 63 then invalidArg "premise" "premise bitmask caps at 64"
             if botCell < 0 then
+                authored.Add { Premise = premise; Cell = cell; Mask = Array.copy mask }
                 meetInto cell mask (1UL <<< premise)
                 quiesce ()
+            botCell < 0
+
+        /// Editor-level operation: do not call with an outstanding search mark. Cone resets
+        /// are direct writes, so the trail is truncated after re-derivation.
+        member _.Retract (premise: int) : bool =
+            if premise < 0 || premise > 63 then invalidArg "premise" "premise bitmask caps at 64"
+            let bit = 1UL <<< premise
+            removeAuthored premise
+
+            let cone = Array.zeroCreate<bool> nCells
+            for c in 0 .. nCells - 1 do
+                if supports.[c] &&& bit <> 0UL then cone.[c] <- true
+
+            if botCell >= 0 && cone.[botCell] then botCell <- -1
+
+            for c in 0 .. nCells - 1 do
+                if cone.[c] then
+                    let b = c * nWords
+                    for w in 0 .. nWords - 1 do words.[b + w] <- topWord.[w]
+                    supports.[c] <- 0UL
+                    onChange c
+
+            for i in 0 .. authored.Count - 1 do
+                let a = authored.[i]
+                if cone.[a.Cell] then meetInto a.Cell a.Mask (1UL <<< a.Premise)
+
+            for c in 0 .. nCells - 1 do
+                if cone.[c] then enqueueIncident c
+
+            for i in 0 .. pendingBot.Count - 1 do enqueue pendingBot.[i]
+            pendingBot.Clear ()
+
+            quiesce ()
+            tLen <- 0
             botCell < 0
 
         member this.AssertTile (premise: int, cell: int, tile: int) : bool =
@@ -246,6 +318,9 @@ module Wfc =
         member _.Has     (cell: int, tile: int) =
             words.[cell * nWords + (tile >>> 6)] &&& (1UL <<< (tile &&& 63)) <> 0UL
         member _.Support (cell: int) = supports.[cell]
+        member _.AuthoredCount = authored.Count
+        member _.AuthoredSnapshot =
+            [| for a in authored -> { a with Mask = Array.copy a.Mask } |]
         /// Entropy = Σ popcount over the cell's words.
         member _.Count   (cell: int) =
             let b = cell * nWords
@@ -523,6 +598,177 @@ let verifyGravity () =
 let gravityRule d (a: int) (b: int) =
     match d with 0 -> a = 1 || b = 0 | 2 -> a = 0 || b = 1 | _ -> true
 
+let maskForTile (nTiles: int) (tile: int) =
+    let nWords = (nTiles + 63) / 64
+    let mask = Array.zeroCreate<uint64> nWords
+    mask.[tile >>> 6] <- 1UL <<< (tile &&& 63)
+    mask
+
+let topMask (nTiles: int) =
+    let nWords = (nTiles + 63) / 64
+    Array.init nWords (fun w ->
+        if w = nWords - 1 && nTiles &&& 63 <> 0
+        then (1UL <<< (nTiles &&& 63)) - 1UL
+        else UInt64.MaxValue)
+
+let replayFromRegistry (width: int) (height: int) (nTiles: int) (allowed: uint64[][][]) (entries: Wfc.AuthoredAssert[]) =
+    let twin = Wfc.Engine(width, height, nTiles, allowed)
+    for a in entries do twin.Assert(a.Premise, a.Cell, a.Mask) |> ignore
+    twin
+
+let compareToReplay (width: int) (height: int) (nTiles: int) (allowed: uint64[][][])
+                    (live: Wfc.Engine) (retracted: int option) =
+    let nCells = width * height
+    let entries = live.AuthoredSnapshot
+    let twin = replayFromRegistry width height nTiles allowed entries
+    if live.Contradiction || twin.Contradiction then
+        live.Contradiction = twin.Contradiction
+    else
+        let survivingBits =
+            entries |> Array.fold (fun bits a -> bits ||| (1UL <<< a.Premise)) 0UL
+        let supportSound (e: Wfc.Engine) =
+            let mutable ok = true
+            for c in 0 .. nCells - 1 do
+                let s = e.Support c
+                ok <- ok && (s &&& (~~~survivingBits)) = 0UL
+                match retracted with
+                | Some p -> ok <- ok && (s &&& (1UL <<< p)) = 0UL
+                | None -> ()
+            ok
+        let mutable sameWords = true
+        for c in 0 .. nCells - 1 do
+            sameWords <- sameWords && (live.Domain c = twin.Domain c)
+        live.WorklistClean && twin.WorklistClean && sameWords && supportSound live && supportSound twin
+
+let staircaseRule d (a: int) b =
+    match d with 1 -> b = a + 1 | 3 -> b = a - 1 | _ -> true
+
+let verifyRetractHandBuilt () =
+    let mutable ok = true
+    let mutable firstFail = ""
+    let note label cond =
+        if ok && not cond then
+            ok <- false
+            firstFail <- label
+
+    let rampAllowed = Wfc.buildAllowed 10 rampRule
+    let eLeft = Wfc.Engine(10, 1, 10, rampAllowed)
+    note "left pins assert" (eLeft.AssertTile(0, 0, 0) && eLeft.AssertTile(1, 9, 9))
+    note "left retract/count" (eLeft.Retract 0 && eLeft.AuthoredCount = 1)
+    note "left oracle" (compareToReplay 10 1 10 rampAllowed eLeft (Some 0))
+
+    let eRight = Wfc.Engine(10, 1, 10, rampAllowed)
+    note "right pins assert" (eRight.AssertTile(0, 0, 0) && eRight.AssertTile(1, 9, 9))
+    note "right retract/count" (eRight.Retract 1 && eRight.AuthoredCount = 1)
+    note "right oracle" (compareToReplay 10 1 10 rampAllowed eRight (Some 1))
+
+    let gravAllowed = Wfc.buildAllowed 2 gravityRule
+    let eShared = Wfc.Engine(3, 3, 2, gravAllowed)
+    let cid r c = r * 3 + c
+    note "shared premise asserts" (eShared.AssertTile(7, cid 2 0, 0) && eShared.AssertTile(7, cid 0 2, 1))
+    note "shared premise retract/count" (eShared.AuthoredCount = 2 && eShared.Retract 7 && eShared.AuthoredCount = 0)
+    for c in 0 .. 8 do note (sprintf "shared premise reset cell %d" c) (eShared.Count c = 2 && eShared.Support c = 0UL)
+
+    let eEmpty = Wfc.Engine(2, 1, 2, gravAllowed)
+    note "empty cone assert" (eEmpty.Assert(9, 0, topMask 2) && eEmpty.AuthoredCount = 1 && eEmpty.Support 0 = 0UL)
+    note "empty cone retract/oracle" (eEmpty.Retract 9 && eEmpty.AuthoredCount = 0 && compareToReplay 2 1 2 gravAllowed eEmpty (Some 9))
+
+    let botRule (_: int) (a: int) (b: int) = if a = 0 then b = 0 else true
+    let botAllowed = Wfc.buildAllowed 2 botRule
+    let eBot = Wfc.Engine(3, 1, 2, botAllowed)
+    note "bot setup assert" (eBot.AssertTile(0, 2, 1))
+    note "bot culprit assert" (not (eBot.AssertTile(1, 1, 0)))
+    let recorded = eBot.AuthoredCount
+    note "rejected assert not recorded" (recorded = 2 && not (eBot.AssertTile(2, 0, 0)) && eBot.AuthoredCount = recorded)
+    note "non-culprit retract stays bot" (not (eBot.Retract 2) && eBot.Contradiction)
+    note "non-culprit oracle" (compareToReplay 3 1 2 botAllowed eBot (Some 2))
+    note "culprit retract clears bot" (eBot.Retract 1 && not eBot.Contradiction)
+    note "culprit oracle" (compareToReplay 3 1 2 botAllowed eBot (Some 1))
+
+    if not ok then printfn "    first hand-built retract failure: %s" firstFail
+    printfn "  retract small cases: one-of-two pins, overlapping cones, shared premise, empty cone, rejected assert, culprit/non-culprit bot -> %b" ok
+    ok
+
+let verifyRetractPendingBot () =
+    // Tile 0 forces every neighbor to 0; tile 1 is inert. The q-wave from cell 2 queues
+    // cell 1, then hits the p-pin at cell 4 and aborts. Retracting p must re-fire pending
+    // cell 1 so the wave reaches cell 0, which is outside p's cone and frontier.
+    let rule (_: int) (a: int) (b: int) = if a = 0 then b = 0 else true
+    let allowed = Wfc.buildAllowed 2 rule
+    let e = Wfc.Engine(5, 1, 2, allowed)
+    let mutable ok = e.AssertTile(0, 4, 1)
+    ok <- ok && not (e.AssertTile(1, 2, 0))
+    ok <- ok && e.Contradiction && e.Tiles 1 = [ 0 ] && e.Tiles 0 = [ 0; 1 ]
+    ok <- ok && e.Retract 0 && not e.Contradiction
+    for c in 0 .. 4 do ok <- ok && e.Tiles c = [ 0 ]
+    ok <- ok && compareToReplay 5 1 2 allowed e (Some 0)
+    printfn "  pendingBot: aborted q-wave outside p-cone completes after culprit retract -> %b" ok
+    ok
+
+let gravity4Rule d (a: int) (b: int) =
+    match d with 0 -> b <= a | 2 -> b >= a | _ -> true
+
+let verifyRetractRandomDifferential () =
+    let runCase name width height nTiles rule seed ops =
+        let allowed = Wfc.buildAllowed nTiles rule
+        let e = Wfc.Engine(width, height, nTiles, allowed)
+        let rng = Random seed
+        let free = ResizeArray<int>([ 0 .. 15 ])
+        let live = ResizeArray<int>()
+        let mutable ok = true
+        let mutable firstFail = ""
+        let note cond msg =
+            if ok && not cond then
+                ok <- false
+                firstFail <- msg
+        for op in 1 .. ops do
+            if ok then
+                let canAssert = not e.Contradiction && free.Count > 0
+                let doAssert = canAssert && (live.Count = 0 || rng.NextDouble() < 0.60)
+                if doAssert then
+                    let i = rng.Next free.Count
+                    let p = free.[i]
+                    free.RemoveAt i
+                    live.Add p
+                    let cell = rng.Next(width * height)
+                    let tile = rng.Next nTiles
+                    e.Assert(p, cell, maskForTile nTiles tile) |> ignore
+                    note (compareToReplay width height nTiles allowed e None)
+                        (sprintf "%s op %d assert p%d cell%d tile%d" name op p cell tile)
+                elif live.Count > 0 then
+                    let i = rng.Next live.Count
+                    let p = live.[i]
+                    live.RemoveAt i
+                    free.Add p
+                    e.Retract p |> ignore
+                    note (compareToReplay width height nTiles allowed e (Some p))
+                        (sprintf "%s op %d retract p%d" name op p)
+                else
+                    note (compareToReplay width height nTiles allowed e None)
+                        (sprintf "%s op %d idle compare" name op)
+        if not ok then printfn "    first random differential failure: %s" firstFail
+        ok
+
+    let okG = runCase "gravity4 6x6" 6 6 4 gravity4Rule 1729 200
+    let colorRule (_: int) (a: int) (b: int) = a <> b
+    let okC = runCase "3color 5x5" 5 5 3 colorRule 2718 200
+    printfn "  randomized retract differential: gravity4=%b 3color=%b" okG okC
+    okG && okC
+
+let verifyRetractPostUsability () =
+    let allowed = Wfc.buildAllowed 2 gravityRule
+    let e = Wfc.Engine(3, 3, 2, allowed)
+    let bottomMiddle = 7
+    let mutable ok = e.AssertTile(0, bottomMiddle, 0)
+    ok <- ok && e.Retract 0 && e.WorklistClean && not e.Contradiction
+    ok <- ok && e.AssertTile(1, bottomMiddle, 0)
+    let failures = ref 0
+    let sols = WfcSearch.allSolutions e 9 (WfcSearch.scanPicker e 9) failures
+    ok <- ok && sols.Length = 16 && List.forall (WfcSearch.isValidSolution 3 3 gravityRule) sols
+    printfn "  post-retract usability: further Assert + Collapse-driven search -> %d solutions, failures=%d, ok=%b"
+        sols.Length failures.Value ok
+    ok
+
 let verifyTrailUndo () =
     // Trail MECHANISM, no search monad involved: nested marks must restore words AND supports
     // exactly (snapshot equality, not just re-quiescence), a ⊥ unwind must leave a usable
@@ -653,6 +899,52 @@ let bench (name: string) (trials: int) (iters: int) (warmup: int) (f: unit -> un
         name best (sum / float trials) trials iters
     best
 
+let benchEdit (name: string) (trials: int) (iters: int) (warmup: int) (prepare: unit -> 'a) (edit: 'a -> unit) =
+    for _ in 1 .. warmup do
+        let state = prepare ()
+        edit state
+    let mutable best = Double.MaxValue
+    let mutable sum = 0.0
+    for _ in 1 .. trials do
+        GC.Collect(); GC.WaitForPendingFinalizers()
+        let mutable elapsed = 0.0
+        for _ in 1 .. iters do
+            let state = prepare ()
+            let sw = Stopwatch.StartNew()
+            edit state
+            sw.Stop()
+            elapsed <- elapsed + sw.Elapsed.TotalMilliseconds
+        let perMs = elapsed / float iters
+        best <- min best perMs
+        sum <- sum + perMs
+    printfn "  %-18s best %10.3f ms/edit  mean %10.3f ms/edit  (%d trials x %d iters)"
+        name best (sum / float trials) trials iters
+    best
+
+let replayRetractInto (target: Wfc.Engine) (premise: int) (entries: Wfc.AuthoredAssert[]) =
+    target.Reset ()
+    for a in entries do
+        if a.Premise <> premise then target.Assert(a.Premise, a.Cell, a.Mask) |> ignore
+    target.Contradiction
+
+let benchRetractPair name width height nTiles allowed premise setup =
+    let live = Wfc.Engine(width, height, nTiles, allowed)
+    let source = Wfc.Engine(width, height, nTiles, allowed)
+    let twin = Wfc.Engine(width, height, nTiles, allowed)
+    let prepareCone () =
+        live.Reset ()
+        setup live
+        live
+    let prepareReplay () =
+        source.Reset ()
+        setup source
+        source.AuthoredSnapshot
+    let coneBest = benchEdit (name + " cone") 3 1 1 prepareCone (fun e -> e.Retract premise |> ignore)
+    let replayBest = benchEdit (name + " replay") 3 1 1 prepareReplay (fun entries -> replayRetractInto twin premise entries |> ignore)
+    let ratio = replayBest / coneBest
+    printfn "  %-18s replay/cone best ratio %.2fx" name ratio
+    coneBest, replayBest, ratio
+
 let main () =
     printfn "runtime: %s" (Runtime.InteropServices.RuntimeInformation.FrameworkDescription)
     printfn ""
@@ -676,13 +968,22 @@ let main () =
     let ok9 = verifyCheckerboard ()
     printfn "== search: lazy first-solution, memoized re-force (LazyList) =="
     let ok10 = verifyFirstSolutionLazy ()
+    printfn "== retract: cone-local hand cases + oracle =="
+    let ok11 = verifyRetractHandBuilt ()
+    printfn "== retract: pendingBot completes a half-propagated outside-cone wave =="
+    let ok12 = verifyRetractPendingBot ()
+    printfn "== retract: randomized compositional differential =="
+    let ok13 = verifyRetractRandomDifferential ()
+    printfn "== retract: post-edit Assert + Collapse-driven search usability =="
+    let ok14 = verifyRetractPostUsability ()
     printfn ""
-    let ok = ok1 && ok2 && ok3 && ok4 && ok5 && ok6 && ok7 && ok8 && ok9 && ok10
+    let ok = ok1 && ok2 && ok3 && ok4 && ok5 && ok6 && ok7 && ok8 && ok9 && ok10 && ok11 && ok12 && ok13 && ok14
     printfn "correctness: %s"
         (if ok then "PASS (store/propagator: ramp single/pinned/site-⊥, staircase mid-wave ⊥, gravity dirs; \
-                     search: trail undo, staircase counts, gravity 64, checkerboard 2, lazy memoized)"
-         else sprintf "FAIL (rampSingle=%b rampPinned=%b siteBot=%b staircase=%b gravity=%b trail=%b stairSearch=%b gravity64=%b checker=%b lazy=%b)"
-                  ok1 ok2 ok3 ok4 ok5 ok6 ok7 ok8 ok9 ok10)
+                     search: trail undo, staircase counts, gravity 64, checkerboard 2, lazy memoized; \
+                     retract: hand/oracle, pendingBot, randomized differential, post-edit search)"
+         else sprintf "FAIL (rampSingle=%b rampPinned=%b siteBot=%b staircase=%b gravity=%b trail=%b stairSearch=%b gravity64=%b checker=%b lazy=%b retractHand=%b pendingBot=%b retractRandom=%b postRetract=%b)"
+                  ok1 ok2 ok3 ok4 ok5 ok6 ok7 ok8 ok9 ok10 ok11 ok12 ok13 ok14)
     printfn ""
 
     if not ok then
@@ -739,6 +1040,36 @@ let main () =
             bench "reset-only W=1"   trials 20 5   (fun () -> eGrav.Reset ()) |> ignore
             bench "gravity column"   trials 20 5   runGrav                    |> ignore
 
+            let mutable timingOk = true
+
+            printfn ""
+            printfn "== timing, 500x500 retract (cone-local vs full replay twin; setup excluded) =="
+            let gravityAllowed = Wfc.buildAllowed 2 gravityRule
+            let setupGravityEdit (e: Wfc.Engine) =
+                e.AssertTile(0, (side - 1) * side + 100, 0) |> ignore
+                e.AssertTile(1, 400, 1) |> ignore
+            let spotSmall = Wfc.Engine(side, side, 2, gravityAllowed)
+            setupGravityEdit spotSmall
+            let okRSmall = spotSmall.Retract 0 && compareToReplay side side 2 gravityAllowed spotSmall (Some 0)
+
+            let ramp512Allowed = Wfc.buildAllowed t512 rampRule
+            let setupRampLarge (e: Wfc.Engine) =
+                e.AssertTile(0, 0, 0) |> ignore
+                e.AssertTile(1, side * side - 1, t512 - 1) |> ignore
+            let spotLarge = Wfc.Engine(side, side, t512, ramp512Allowed)
+            setupRampLarge spotLarge
+            let okRLarge = spotLarge.Retract 0 && compareToReplay side side t512 ramp512Allowed spotLarge (Some 0)
+
+            if okRSmall && okRLarge then
+                let _, _, smallRatio =
+                    benchRetractPair "gravity-small" side side 2 gravityAllowed 0 setupGravityEdit
+                let _, _, largeRatio =
+                    benchRetractPair "ramp512-large" side side t512 ramp512Allowed 0 setupRampLarge
+                printfn "   retract ratios: gravity-small %.2fx, ramp512-large %.2fx (replay/cone best)" smallRatio largeRatio
+            else
+                timingOk <- false
+                eprintfn "Refusing to accept retract timing: spot checks failed (small=%b large=%b)" okRSmall okRLarge
+
             // --- items 3+4 end-to-end: full-map generation = Reset + heap rebuild + FIRST
             // solution off the lazy driver. Seeded rng per run -> identical work every
             // iteration. Each row runs on a big-stack thread: forcing holds one bracket of
@@ -772,6 +1103,6 @@ let main () =
                     bench "3color gen 500x500"  trials 1 1 (fun () -> genOnce e3c (side * side) 42 (ref 0) |> ignore)) |> ignore
                 WfcSearch.runDeep 1024 (fun () ->
                     bench "ramp32 gen 64x64"    trials 2 1 (fun () -> genOnce eRamp32 (64 * 64) 42 (ref 0) |> ignore)) |> ignore
-                0
+                if timingOk then 0 else 1
 
 exit (main ())

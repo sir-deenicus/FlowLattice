@@ -285,6 +285,39 @@ Godot + AsyncRx streaming is the *target*, not a tracked build step — dropped 
    premise bits into non-cone supports — violates the OR-on-narrow policy (harmless under replay-ALL,
    pollutes provenance and inflates future cones under cone-local). Restrict the re-meld to cone cells.
 
+   **BUILT + verified 2026-07-05** in [propagator-wfc.fsx](../propagator-wfc.fsx). As built:
+   (a) `Assert` records accepted authored assertions as `(premise, cell, mask copy)` before propagation,
+   including the assertion that causes `⊥`; assertions refused because the store is already contradicted
+   are not recorded, and `Reset` clears the registry. (b) `quiesce` preserves bot-aborted frontier in
+   `pendingBot`; in addition to drained queue ids, it records the currently firing cell when a fire is
+   cut short by `⊥`, which is idempotent and covers the partially-fired-cell case. Normal quiescence,
+   `Reset`, and `UndoTo` clear it. (c) `Retract p` removes every authored entry for `p`, scans the support
+   cone, clears `botCell` only when the bot is in that cone, resets cone cells to `⊤` with support `0`,
+   re-melds only surviving authored entries whose target is inside the cone, then enqueues cone cells,
+   structural neighbors, and `pendingBot` before quiescing. It truncates the trail afterward, so authored
+   edits cannot be crossed by later `UndoTo`. (d) The test oracle rebuilds a twin from the surviving
+   registry; `⊥` comparisons are flag-only, non-`⊥` comparisons require exact values and clean worklists,
+   and support checks enforce no retracted bit plus support masks within the surviving authored-premise
+   set, without requiring exact support-mask equality. Verified hand cases cover one-of-two pins,
+   overlapping cones, shared-premise removal, empty-cone/no-narrow asserts, rejected asserts, culprit and
+   non-culprit retracts on `⊥`, and a `pendingBot` wave that must finish outside the culprit cone. The
+   randomized differential runs 200 edits each on 6×6 gravity4 and 5×5 3-color. Post-retract `Assert` and
+   `Collapse`-driven search still work. 500×500 timing in [benchmarks.md](benchmarks.md): gravity small
+   cone cone-local 1.991 ms/edit vs replay 3.351 ms/edit (1.68× replay/cone); ramp512 large cone
+   9920.649 ms/edit vs replay 5641.265 ms/edit (0.57×), the expected dense-frontier degenerate.
+
+   **Review gate 2026-07-05 (tier 0): PASSED.** All locked decisions implemented as written — registry
+   iff-applied (rejected-assert case tested), oracle uses flag-only ⊥ compare + exact values + clean
+   worklists + retracted-bit-gone + supports ⊆ surviving-OR, and does NOT compare exact support masks
+   (the trap was avoided, not tripped); `Retract` follows steps a–h including cone-only re-meld and
+   trail truncation; benchmark replay side times the twin's full `Reset` inside the edit, so the 1.68×
+   small-cone ratio is fair. One as-built delta beyond the brief, correct and properly declared: on
+   ⊥-abort, `pendingBot` also records the *partially-fired* cell (its remaining directional pushes are
+   otherwise lost — a genuine gap in the work order's "record the drained ids" wording; the executor's
+   fix is right and the `verifyRetractPendingBot` trace depends on it). Editor-layer note, policy not
+   engine: the large-cone 0.57× degenerate suggests a later hybrid — the cone scan already yields cone
+   size, so fall back to full replay past a size threshold; zero engine change.
+
 Order: 1 → 2 → (verify on a small grid) → 3 + 4 (generation works end-to-end) → 5 (authored edits).
 Benchmark at 500×500 along the way. The earlier micro-opts (#4 emit read, #5 preallocation) stay noise at
 this scale — skip.

@@ -116,6 +116,38 @@ staircase tests cover the unwind path with exact counts), and the dense-⊤ AC-4
 during generation — firing cells are near-collapsed once the driver is placing tiles, as the plan
 predicted.
 
+---
+
+## 2026-07-05 — cone-local `Retract` vs full-replay twin
+
+- **Source:** [propagator-wfc.fsx](../propagator-wfc.fsx) — item 5 of [mutable-core-plan.md](mutable-core-plan.md): accepted authored asserts are registered, bot-aborted work is preserved in `pendingBot`, and `Retract` resets only the premise support cone before re-firing cone cells plus structural neighbors.
+- **Scenario:** 500×500 grid. The retract rows time the edit only: each iteration first rebuilds the same pre-retract state outside the stopwatch, then times either cone-local `Retract` or a twin reference that resets and replays the surviving authored registry. Small cone = gravity, two column pins, retract one. Large cone = ramp512 opposite-corner pins, retract one whose wave narrowed a large fraction of the map.
+- **Runtime:** .NET 9.0.12, `dotnet fsi`, optimizations **OFF** (fsi default)
+- **Machine:** Intel Core i7-8750H (Coffee Lake), throttled to 65% — ratios are the signal
+- **Harness:** best-of-3 trials × 1 edit for retract rows, one process, `GC.Collect` between trials. Existing reset/assert and generation rows also ran in the same process.
+- **Correctness:** all prior store/search verifications plus item-5 hand/oracle cases, `pendingBot` half-wave completion, seeded randomized compositional differential (6×6 gravity4 and 5×5 3-color, 200 ops each), and post-retract Assert + search usability passed before timing.
+- **Commit:** `42058ba` + working tree changes to `propagator-wfc.fsx`
+
+| edit row | scenario | cone-local best ms/edit | cone-local mean | replay best ms/edit | replay mean | replay/cone best |
+|----------|----------|------------------------:|----------------:|--------------------:|------------:|-----------------:|
+| gravity-small | T=2, one-column cone | 1.991 | 2.243 | 3.351 | 3.883 | **1.68×** |
+| ramp512-large | T=512, dense large cone | 9920.649 | 10033.978 | 5641.265 | 6334.822 | 0.57× |
+
+Same-process anchor rows from this run:
+
+| row | best ms/run | mean ms/run |
+|-----|------------:|------------:|
+| reset-only W=8 | 6.971 | 9.259 |
+| ramp512 corner | 5378.547 | 5891.034 |
+| ramp128 center | 139.695 | 144.847 |
+| reset-only W=1 | 1.553 | 1.923 |
+| gravity column | 1.658 | 1.813 |
+| gravity gen 500×500 | 313.082 | 333.368 |
+| 3color gen 500×500 | 36899.853 | 39603.271 |
+| ramp32 gen 64×64 | 102.040 | 166.986 |
+
+**Reading.** The locality win shows up on the authored-edit case item 5 was built for: a one-column gravity cone beats full replay by **1.68×** even in fsi optimize-off, with only one surviving pin to replay. The large dense ramp case is the honest degenerate: cone-local must reset and re-fire a huge dense-domain frontier, so full replay of the surviving opposite-corner pin is faster in this harness. That is acceptable for the design: the interactive-edit payoff is small cones, while large cones collapse back toward replay-scale cost.
+
 <!-- Template for the next run — copy the section above, update the env block, add rows.
 ## YYYY-MM-DD — <what changed>
 - **Source:** …
