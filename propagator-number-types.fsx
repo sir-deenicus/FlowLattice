@@ -709,3 +709,453 @@ bargain: fix one small engine over cells ordered by information, and the distanc
 converting a temperature, choosing a number type, and weighing three measurements of a
 building is entirely a matter of what the cells carry and how they are wired.
 *)
+
+(**
+## Rejected robustness patches, measured
+
+Two tempting patches do not repair the scalar lattice. The first rounds every arithmetic
+operation to a fixed decimal grid and then retains exact equality. The second keeps binary
+floating point but lets the scalar meet treat values up to four ULPs apart as equal. These
+are measured on the same grids quoted above: 0.0 through 200.0 Celsius in tenths (2001
+inputs), and 0.0 through 180.0 Fahrenheit in tenths (1801 inputs).
+*)
+
+module RejectedRobustness =
+    let quantum = 0.1m
+
+    // A deliberately naive standalone fixed-point scalar. Every primitive operation rounds
+    // to the nearest q=0.1 grid point (ties to even), after which meet would use exact (=).
+    let private quantize value =
+        System.Decimal.Round(value / quantum, 0, System.MidpointRounding.ToEven) * quantum
+
+    let private add a b = quantize (a + b)
+    let private sub a b = quantize (a - b)
+    let private mul a b = quantize (a * b)
+    let private div a b = quantize (a / b)
+
+    let private cToF c = add (div (mul c 9m) 5m) 32m
+    let private fToC f = div (mul (sub f 32m) 5m) 9m
+
+    let naiveFixedCFailures =
+        [ 0 .. 2000 ]
+        |> List.sumBy (fun tick ->
+            let c = decimal tick / 10m
+            if c |> cToF |> fToC = c then 0 else 1)
+
+    let naiveFixedFFailures =
+        [ 0 .. 1800 ]
+        |> List.sumBy (fun tick ->
+            let f = decimal tick / 10m
+            if f |> fToC |> cToF = f then 0 else 1)
+
+    let private sameSignUlpDistance (a: float) (b: float) =
+        let aBits = uint64 (System.BitConverter.DoubleToInt64Bits a)
+        let bBits = uint64 (System.BitConverter.DoubleToInt64Bits b)
+        if (aBits >>> 63) <> (bBits >>> 63) then System.UInt64.MaxValue
+        elif aBits >= bBits then aBits - bBits
+        else bBits - aBits
+
+    let withinFourUlps a b =
+        a = b
+        || (not (System.Double.IsNaN a || System.Double.IsNaN b)
+            && sameSignUlpDistance a b <= 4UL)
+
+    let private floatCToF c = c * 9.0 / 5.0 + 32.0
+    let private floatFToC f = (f - 32.0) * 5.0 / 9.0
+
+    let tolerantCFailures =
+        [ 0 .. 2000 ]
+        |> List.sumBy (fun tick ->
+            let c = float tick / 10.0
+            if withinFourUlps c (c |> floatCToF |> floatFToC) then 0 else 1)
+
+    let tolerantFFailures =
+        [ 0 .. 1800 ]
+        |> List.sumBy (fun tick ->
+            let f = float tick / 10.0
+            if withinFourUlps f (f |> floatFToC |> floatCToF) then 0 else 1)
+
+    // These are real unequal assertions one representable float apart. A 4-ULP meet
+    // accepts every one, demonstrating the false-settle defect independently of C/F.
+    let tolerantFalseSettles =
+        [ yield! [ 0 .. 2000 ] |> List.map (fun tick -> float tick / 10.0)
+          yield! [ 0 .. 1800 ] |> List.map (fun tick -> float tick / 10.0) ]
+        |> List.sumBy (fun value ->
+            let different = System.Math.BitIncrement value
+            if different <> value && withinFourUlps value different then 1 else 0)
+
+printfn "6. rejected robustness patches"
+printfn "  naive fixed q=0.1: C failures %d/2001, F failures %d/1801"
+    RejectedRobustness.naiveFixedCFailures RejectedRobustness.naiveFixedFFailures
+printfn "  float eq within 4 ULP: C failures %d/2001, F failures %d/1801, false settles %d/3802"
+    RejectedRobustness.tolerantCFailures
+    RejectedRobustness.tolerantFFailures
+    RejectedRobustness.tolerantFalseSettles
+
+if RejectedRobustness.naiveFixedFFailures = 0 then
+    failwith "naive fixed point unexpectedly hid its contracting-direction failure"
+
+if RejectedRobustness.tolerantFalseSettles = 0 then
+    failwith "ULP-tolerant equality unexpectedly accepted no genuinely unequal values"
+
+(**
+The measured rows are:
+
+| scalar policy | C -> F -> C spurious bottoms | F -> C -> F spurious bottoms | false settles |
+|---|---:|---:|---:|
+| exact `float` equality (the original row) | 901 / 2001 | not previously recorded | 0 by definition |
+| exact `decimal` equality (the original row) | 0 / 2001 | 77 / 1801 | 0 by definition |
+| naive fixed point, q = 0.1 | 0 / 2001 | **800 / 1801** | 0 by definition |
+| `float` equality within 4 ULPs | **19 / 2001** | **12 / 1801** | **3802 / 3802** one-ULP conflicts |
+| quantized interval facade, q = 0.1 | **0 / 2001** | **0 / 1801** | 0; conflict uses intersection |
+
+Naive fixed point is worse than decimal in the contracting Fahrenheit direction: several
+Fahrenheit grid points collapse onto the same Celsius grid point, so expansion cannot
+recover which point was asserted. Four-ULP equality reduces the original float failures
+but does not eliminate them, and its third count is disqualifying: it calls every tested
+pair of distinct adjacent representable values equal. It also makes equality non-transitive
+(`a` can agree with `b`, and `b` with `c`, while `a` does not agree with `c`), so
+propagation can become order-dependent. The interval facade is the only measured inexact
+route with zero fabricated bottoms that still rejects genuine conflicts. Neither scalar
+patch supplies a sound meet.
+
+## 7. Fixed point as a quantized facade over intervals
+
+Fixed point contributes a user-meaningful decimal grid, not another knowledge lattice.
+The sealed `FixedPoint` class is an expression and presentation facade over `Interval`:
+its public decimal constructor infers quantum from the decimal's written scale, and its
+operators delegate to the unchanged outward-rounded interval arithmetic. Thus
+`FixedPoint(12.50m)` carries q = 0.01, while `FixedPoint(12.5m)` carries q = 0.1.
+
+Two fixed operands must have the same quantum; a mismatch fails loudly until the caller
+uses `WithQuantum` to make the modeling choice explicit. A plain decimal operand is an
+exact constant and retains the fixed operand's quantum. No operator rounds to the user grid.
+`TryPoint` and `ToString()` present an interval as grid point `g` only when the whole
+closed interval fits in the half-open cell `[g - q/2, g + q/2)`; otherwise the interval
+remains visible. The lower boundary belongs to `g`, while the upper belongs to the next
+cell.
+
+The propagator cells below still store `Interval`. A private adapter wraps an interval
+before a user-authored relation and unwraps the result afterward, so relation code uses
+ordinary `+`, `-`, `*`, and `/` without making the facade a second lattice. Exact
+decimal-vs-double comparison remains boundary machinery only.
+*)
+
+open System.Numerics
+
+module private FixedPointBoundary =
+    let requireQuantum quantum =
+        if quantum <= 0m then invalidArg "quantum" "The fixed-point quantum must be positive."
+
+    let inferQuantum (value: decimal) =
+        let scale = (System.Decimal.GetBits(value).[3] >>> 16) &&& 0xFF
+        let mutable quantum = 1m
+        for _ in 1 .. scale do
+            quantum <- quantum / 10m
+        quantum
+
+    let private decimalFraction (value: decimal) =
+        let bits = System.Decimal.GetBits value
+        let lo = bigint (uint32 bits.[0])
+        let mid = bigint (uint32 bits.[1]) <<< 32
+        let hi = bigint (uint32 bits.[2]) <<< 64
+        let coefficient = lo + mid + hi
+        let scale = (bits.[3] >>> 16) &&& 0x7F
+        let numerator = if bits.[3] < 0 then -coefficient else coefficient
+        numerator, BigInteger.Pow(10I, scale)
+
+    let private doubleFraction (value: float) =
+        let raw = uint64 (System.BitConverter.DoubleToInt64Bits value)
+        let negative = (raw >>> 63) <> 0UL
+        let exponentBits = int ((raw >>> 52) &&& 0x7FFUL)
+        let fractionBits = raw &&& 0x000FFFFFFFFFFFFFUL
+        let significand, exponent =
+            if exponentBits = 0 then bigint fractionBits, -1074
+            else bigint (fractionBits ||| 0x0010000000000000UL), exponentBits - 1023 - 52
+        let signed = if negative then -significand else significand
+        if exponent >= 0 then signed <<< exponent, 1I
+        else signed, 1I <<< -exponent
+
+    // Exact comparison: no decimal-to-double round trip is used to decide enclosure.
+    let private compareDoubleToDecimal (binary: float) (exact: decimal) =
+        if System.Double.IsNaN binary then invalidArg "binary" "NaN has no ordered decimal comparison."
+        elif System.Double.IsNegativeInfinity binary then -1
+        elif System.Double.IsPositiveInfinity binary then 1
+        else
+            let binaryNumerator, binaryDenominator = doubleFraction binary
+            let decimalNumerator, decimalDenominator = decimalFraction exact
+            compare
+                (binaryNumerator * decimalDenominator)
+                (decimalNumerator * binaryDenominator)
+
+    let literal value =
+        let nearest = float value
+        match compareDoubleToDecimal nearest value with
+        | 0 -> Iv(nearest, nearest)
+        | n when n < 0 -> Iv(nearest, System.Math.BitIncrement nearest)
+        | _ -> Iv(System.Math.BitDecrement nearest, nearest)
+
+    let private fitsCell quantum gridValue lo hi =
+        let half = quantum / 2m
+        let lower = gridValue - half
+        let upper = gridValue + half
+        compareDoubleToDecimal lo lower >= 0
+        && compareDoubleToDecimal hi upper < 0
+
+    let tryPoint quantum interval =
+        requireQuantum quantum
+        match interval with
+        | Empty -> None
+        | Iv(lo, hi) when System.Double.IsFinite lo && System.Double.IsFinite hi ->
+            try
+                let center = decimal (lo / 2.0 + hi / 2.0)
+                let nearestTick =
+                    System.Decimal.Round(center / quantum, 0, System.MidpointRounding.ToEven)
+                [ nearestTick - 1m; nearestTick; nearestTick + 1m ]
+                |> List.map (fun tick -> tick * quantum)
+                |> List.tryFind (fun gridValue -> fitsCell quantum gridValue lo hi)
+            with :? System.OverflowException ->
+                None
+        | _ -> None
+
+    let format quantum interval =
+        let decimalText (value: decimal) =
+            value.ToString("G29", System.Globalization.CultureInfo.InvariantCulture)
+        match interval, tryPoint quantum interval with
+        | Empty, _ -> "BOT (contradiction)"
+        | _, Some value -> decimalText value
+        | Iv(lo, hi), None -> sprintf "[%.17g, %.17g]" lo hi
+
+[<Sealed>]
+type FixedPoint private (interval: Interval, quantum: decimal) =
+    do FixedPointBoundary.requireQuantum quantum
+
+    new (value: decimal) =
+        FixedPoint(
+            FixedPointBoundary.literal value,
+            FixedPointBoundary.inferQuantum value)
+
+    new (value: decimal, quantum: decimal) =
+        FixedPoint(FixedPointBoundary.literal value, quantum)
+
+    member _.Quantum = quantum
+    member _.IsBottom = interval = Empty
+    member _.TryPoint = FixedPointBoundary.tryPoint quantum interval
+    member _.WithQuantum(newQuantum: decimal) = FixedPoint(interval, newQuantum)
+    member internal _.Interval = interval
+
+    override _.ToString() = FixedPointBoundary.format quantum interval
+
+    static member internal FromInterval(interval: Interval, quantum: decimal) =
+        FixedPoint(interval, quantum)
+
+    static member private SharedQuantum(left: FixedPoint, right: FixedPoint) =
+        if left.Quantum <> right.Quantum then
+            invalidArg "right" "Fixed-point arithmetic requires matching quanta; use WithQuantum explicitly."
+        left.Quantum
+
+    static member (+) (left: FixedPoint, right: FixedPoint) =
+        FixedPoint(
+            Interval.add left.Interval right.Interval,
+            FixedPoint.SharedQuantum(left, right))
+
+    static member (+) (left: FixedPoint, right: decimal) =
+        FixedPoint(Interval.add left.Interval (FixedPointBoundary.literal right), left.Quantum)
+
+    static member (+) (left: decimal, right: FixedPoint) =
+        FixedPoint(Interval.add (FixedPointBoundary.literal left) right.Interval, right.Quantum)
+
+    static member (-) (left: FixedPoint, right: FixedPoint) =
+        FixedPoint(
+            Interval.sub left.Interval right.Interval,
+            FixedPoint.SharedQuantum(left, right))
+
+    static member (-) (left: FixedPoint, right: decimal) =
+        FixedPoint(Interval.sub left.Interval (FixedPointBoundary.literal right), left.Quantum)
+
+    static member (-) (left: decimal, right: FixedPoint) =
+        FixedPoint(Interval.sub (FixedPointBoundary.literal left) right.Interval, right.Quantum)
+
+    static member (*) (left: FixedPoint, right: FixedPoint) =
+        FixedPoint(
+            Interval.mul left.Interval right.Interval,
+            FixedPoint.SharedQuantum(left, right))
+
+    static member (*) (left: FixedPoint, right: decimal) =
+        FixedPoint(Interval.mul left.Interval (FixedPointBoundary.literal right), left.Quantum)
+
+    static member (*) (left: decimal, right: FixedPoint) =
+        FixedPoint(Interval.mul (FixedPointBoundary.literal left) right.Interval, right.Quantum)
+
+    static member (/) (left: FixedPoint, right: FixedPoint) =
+        FixedPoint(
+            Interval.div left.Interval right.Interval,
+            FixedPoint.SharedQuantum(left, right))
+
+    static member (/) (left: FixedPoint, right: decimal) =
+        FixedPoint(Interval.div left.Interval (FixedPointBoundary.literal right), left.Quantum)
+
+    static member (/) (left: decimal, right: FixedPoint) =
+        FixedPoint(Interval.div (FixedPointBoundary.literal left) right.Interval, right.Quantum)
+
+let private requireOracle label condition =
+    if not condition then failwithf "fixed-point oracle failed: %s" label
+
+let fixedPointQuantum = 0.1m
+
+let fixedCToF (c: FixedPoint) = c * 9m / 5m + 32m
+let fixedFToC (f: FixedPoint) = (f - 32m) * 5m / 9m
+
+let private applyFixed (quantum: decimal) (transform: FixedPoint -> FixedPoint) (interval: Interval) =
+    FixedPoint.FromInterval(interval, quantum)
+    |> transform
+    |> fun result -> result.Interval
+
+let buildFixedCF quantum =
+    let e = Engine<Interval>(intervalL)
+    let cC = e.NewCell()
+    let fF = e.NewCell()
+    e.AddProp([cC], fun () ->
+        match cC.value with
+        | Empty -> []
+        | interval ->
+            [ fF,
+              { value = applyFixed quantum fixedCToF interval
+                support = cC.support } ])
+    |> ignore
+    e.AddProp([fF], fun () ->
+        match fF.value with
+        | Empty -> []
+        | interval ->
+            [ cC,
+              { value = applyFixed quantum fixedFToC interval
+                support = fF.support } ])
+    |> ignore
+    e, cC, fF
+
+let private fixedAt quantum interval = FixedPoint.FromInterval(interval, quantum)
+
+printfn "7. fixed point facade over intervals"
+let inferredTenths = FixedPoint(1.0m)
+let inferredHundredths = FixedPoint(12.50m)
+requireOracle "constructor infers q=0.1" (inferredTenths.Quantum = 0.1m)
+requireOracle "constructor preserves trailing-zero scale" (inferredHundredths.Quantum = 0.01m)
+requireOracle "decimal constants retain the fixed quantum"
+    ((inferredHundredths * 2m + 1m).Quantum = 0.01m)
+let mismatchedQuantumRejected =
+    let other = FixedPoint(1.2m)
+    [ (fun () -> inferredHundredths + other)
+      (fun () -> inferredHundredths - other)
+      (fun () -> inferredHundredths * other)
+      (fun () -> inferredHundredths / other) ]
+    |> List.forall (fun operation ->
+        try
+            operation () |> ignore
+            false
+        with :? System.ArgumentException ->
+            true)
+requireOracle "mismatched fixed operands fail loudly" mismatchedQuantumRejected
+requireOracle "WithQuantum explicitly reconciles fixed operands"
+    ((inferredHundredths.WithQuantum(0.1m) + FixedPoint(1.2m)).Quantum = 0.1m)
+
+let operatorInterop =
+    let x = FixedPoint(2.00m)
+    [ x + 3m; 3m + x
+      x - 3m; 3m - x
+      x * 3m; 3m * x
+      x / 3m; 3m / x ]
+requireOracle "all arithmetic operators interoperate with decimal in both positions"
+    (operatorInterop |> List.forall (fun result -> not result.IsBottom))
+
+let assertedC = FixedPoint(1.0m)
+let eqc, qcc, qfc = buildFixedCF assertedC.Quantum
+eqc.Assert(1, qcc, assertedC.Interval)
+printfn "  assert C=1: C = %s, F = %s"
+    ((fixedAt assertedC.Quantum (eqc.Value qcc)).ToString())
+    ((fixedAt assertedC.Quantum (eqc.Value qfc)).ToString())
+
+let assertedF = FixedPoint(47.0m)
+let eqf, qcf, qff = buildFixedCF assertedF.Quantum
+eqf.Assert(1, qff, assertedF.Interval)
+printfn "  assert F=47: C = %s, F = %s"
+    ((fixedAt assertedF.Quantum (eqf.Value qcf)).ToString())
+    ((fixedAt assertedF.Quantum (eqf.Value qff)).ToString())
+
+let conflictC = FixedPoint(1.0m)
+let conflictF = FixedPoint(100.0m)
+let eqConflict, qcConflict, qfConflict = buildFixedCF fixedPointQuantum
+eqConflict.Assert(1, qcConflict, conflictC.Interval)
+eqConflict.Assert(2, qfConflict, conflictF.Interval)
+printfn "  assert C=1 and F=100: F = %s"
+    ((fixedAt fixedPointQuantum (eqConflict.Value qfConflict)).ToString())
+
+let mutable facadeCFailures = 0
+let mutable facadeCDisplayFailures = 0
+for tick in 0 .. 2000 do
+    let asserted = decimal tick / 10m
+    let authored = FixedPoint(asserted, fixedPointQuantum)
+    let sweepEngine, sweepC, sweepF = buildFixedCF fixedPointQuantum
+    sweepEngine.Assert(1, sweepC, authored.Interval)
+    let shownC = fixedAt fixedPointQuantum (sweepEngine.Value sweepC)
+    let shownF = fixedAt fixedPointQuantum (sweepEngine.Value sweepF)
+    if shownC.IsBottom || shownF.IsBottom then
+        facadeCFailures <- facadeCFailures + 1
+    if shownC.TryPoint <> Some asserted then
+        facadeCDisplayFailures <- facadeCDisplayFailures + 1
+
+let mutable facadeFFailures = 0
+let mutable facadeFDisplayFailures = 0
+for tick in 0 .. 1800 do
+    let asserted = decimal tick / 10m
+    let authored = FixedPoint(asserted, fixedPointQuantum)
+    let sweepEngine, sweepC, sweepF = buildFixedCF fixedPointQuantum
+    sweepEngine.Assert(1, sweepF, authored.Interval)
+    let shownC = fixedAt fixedPointQuantum (sweepEngine.Value sweepC)
+    let shownF = fixedAt fixedPointQuantum (sweepEngine.Value sweepF)
+    if shownC.IsBottom || shownF.IsBottom then
+        facadeFFailures <- facadeFFailures + 1
+    if shownF.TryPoint <> Some asserted then
+        facadeFDisplayFailures <- facadeFDisplayFailures + 1
+
+printfn "  facade sweep: C bottoms %d/2001, F bottoms %d/1801, display failures %d"
+    facadeCFailures facadeFFailures (facadeCDisplayFailures + facadeFDisplayFailures)
+
+requireOracle "Celsius sweep has no spurious bottoms" (facadeCFailures = 0)
+requireOracle "Fahrenheit sweep has no spurious bottoms" (facadeFFailures = 0)
+requireOracle "on-grid assertions display identically"
+    (facadeCDisplayFailures = 0 && facadeFDisplayFailures = 0)
+requireOracle "wide intervals remain intervals"
+    ((fixedAt fixedPointQuantum (Iv(1.0, 1.2))).TryPoint = None)
+requireOracle "genuine conflict remains bottom"
+    ((fixedAt fixedPointQuantum (eqConflict.Value qfConflict)).IsBottom)
+
+let eqBarometer, qt, qh, qbh, qbShadow, qbldShadow = buildBarometer ()
+eqBarometer.Assert(STOPWATCH, qt, Iv(3.0, 3.2))
+eqBarometer.Assert(SHADOWS, qbh, Iv(0.30, 0.30))
+eqBarometer.Assert(SHADOWS, qbShadow, Iv(0.30, 0.32))
+eqBarometer.Assert(SHADOWS, qbldShadow, Iv(45.0, 48.0))
+eqBarometer.Assert(SUPER, qh, FixedPoint(49.0m).Interval)
+eqBarometer.Retract(SHADOWS)
+
+let barometerTenths = fixedAt 0.1m (eqBarometer.Value qt)
+let barometerHundredths = barometerTenths.WithQuantum 0.01m
+printfn "  barometer sqrt(10): q=0.1 -> %s, q=0.01 -> %s"
+    (barometerTenths.ToString())
+    (barometerHundredths.ToString())
+requireOracle "barometer q=0.1 reads 3.2" (barometerTenths.TryPoint = Some 3.2m)
+requireOracle "barometer q=0.01 reads 3.16" (barometerHundredths.TryPoint = Some 3.16m)
+
+(**
+The actual relations are now the ordinary formulas
+`c * 9m / 5m + 32m` and `(f - 32m) * 5m / 9m`; only the private adapter sees the
+interval carried by the cell. The facade returns `1` and `33.8` for the float-killing
+Celsius assertion, and `47` cleanly from the Fahrenheit direction. The incompatible
+100 Fahrenheit assertion remains `Bot`; a wide interval remains an interval; and every
+one of the 3802 on-grid sweep inputs round-trips through display without a fabricated
+contradiction. The barometer's unchanged internal interval around `sqrt(10)` renders as
+`3.2` at q = 0.1 and `3.16` after `WithQuantum 0.01m`.
+
+No interval is rounded to the user grid during construction, propagation, or overloaded
+arithmetic. Changing `WithQuantum` changes presentation only, as the two barometer views
+of the same interval demonstrate.
+*)

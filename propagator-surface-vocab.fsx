@@ -307,9 +307,9 @@ module Constraint =
                       [ None ] }
 
     /// The portable all-different relation used by the friendly finite shorthand.
-// ---- A rich lattice value type used by the general-only slice (verbatim) ----
+// ---- The canonical rich interval lattice used by the general face ----
 // Copied from propagator-friendly.fsx / propagator-number-types.fsx §4: meet = intersection,
-// Bot = Empty, outward-rounded arithmetic. Only the C<->F slice uses it.
+// Bot = Empty, outward-rounded arithmetic. Friendly interval and fixed-point domains delegate here.
 
 type Interval = Empty | Iv of float * float
 
@@ -367,6 +367,162 @@ type Interval with
     static member (/) (left: Interval, right: float) = Interval.div left (Interval.pt right)
     static member (/) (left: float, right: Interval) = Interval.div (Interval.pt left) right
     static member Sqrt (value: Interval) = Interval.sqrt value
+
+// A quantized expression/presentation facade over Interval. Arithmetic never rounds to the
+// user grid; the wrapped Interval remains the sole arithmetic authority.
+module private FixedPointBoundary =
+    let requireQuantum quantum =
+        if quantum <= 0m then invalidArg "quantum" "The fixed-point quantum must be positive."
+
+    let inferQuantum (value: decimal) =
+        let scale = (System.Decimal.GetBits(value).[3] >>> 16) &&& 0xFF
+        let mutable quantum = 1m
+        for _ in 1 .. scale do
+            quantum <- quantum / 10m
+        quantum
+
+    let private decimalFraction (value: decimal) =
+        let bits = System.Decimal.GetBits value
+        let lo = bigint (uint32 bits.[0])
+        let mid = bigint (uint32 bits.[1]) <<< 32
+        let hi = bigint (uint32 bits.[2]) <<< 64
+        let coefficient = lo + mid + hi
+        let scale = (bits.[3] >>> 16) &&& 0x7F
+        let numerator = if bits.[3] < 0 then -coefficient else coefficient
+        numerator, BigInteger.Pow(10I, scale)
+
+    let private doubleFraction (value: float) =
+        let raw = uint64 (System.BitConverter.DoubleToInt64Bits value)
+        let negative = (raw >>> 63) <> 0UL
+        let exponentBits = int ((raw >>> 52) &&& 0x7FFUL)
+        let fractionBits = raw &&& 0x000FFFFFFFFFFFFFUL
+        let significand, exponent =
+            if exponentBits = 0 then bigint fractionBits, -1074
+            else bigint (fractionBits ||| 0x0010000000000000UL), exponentBits - 1023 - 52
+        let signed = if negative then -significand else significand
+        if exponent >= 0 then signed <<< exponent, 1I
+        else signed, 1I <<< -exponent
+
+    let private compareDoubleToDecimal (binary: float) (exact: decimal) =
+        if System.Double.IsNaN binary then invalidArg "binary" "NaN has no ordered decimal comparison."
+        elif System.Double.IsNegativeInfinity binary then -1
+        elif System.Double.IsPositiveInfinity binary then 1
+        else
+            let binaryNumerator, binaryDenominator = doubleFraction binary
+            let decimalNumerator, decimalDenominator = decimalFraction exact
+            compare
+                (binaryNumerator * decimalDenominator)
+                (decimalNumerator * binaryDenominator)
+
+    let literal value =
+        let nearest = float value
+        match compareDoubleToDecimal nearest value with
+        | 0 -> Iv(nearest, nearest)
+        | n when n < 0 -> Iv(nearest, System.Math.BitIncrement nearest)
+        | _ -> Iv(System.Math.BitDecrement nearest, nearest)
+
+    let private fitsCell quantum gridValue lo hi =
+        let half = quantum / 2m
+        let lower = gridValue - half
+        let upper = gridValue + half
+        compareDoubleToDecimal lo lower >= 0
+        && compareDoubleToDecimal hi upper < 0
+
+    let tryPoint quantum interval =
+        requireQuantum quantum
+        match interval with
+        | Empty -> None
+        | Iv(lo, hi) when System.Double.IsFinite lo && System.Double.IsFinite hi ->
+            try
+                let center = decimal (lo / 2.0 + hi / 2.0)
+                let nearestTick =
+                    System.Decimal.Round(center / quantum, 0, System.MidpointRounding.ToEven)
+                [ nearestTick - 1m; nearestTick; nearestTick + 1m ]
+                |> List.map (fun tick -> tick * quantum)
+                |> List.tryFind (fun gridValue -> fitsCell quantum gridValue lo hi)
+            with :? System.OverflowException ->
+                None
+        | _ -> None
+
+    let format quantum interval =
+        let decimalText (value: decimal) =
+            value.ToString("G29", System.Globalization.CultureInfo.InvariantCulture)
+        match interval, tryPoint quantum interval with
+        | Empty, _ -> "BOT (contradiction)"
+        | _, Some value -> decimalText value
+        | Iv(lo, hi), None -> sprintf "[%.17g, %.17g]" lo hi
+
+[<Sealed>]
+type FixedPoint private (interval: Interval, quantum: decimal) =
+    do FixedPointBoundary.requireQuantum quantum
+
+    new (value: decimal) =
+        FixedPoint(
+            FixedPointBoundary.literal value,
+            FixedPointBoundary.inferQuantum value)
+
+    new (value: decimal, quantum: decimal) =
+        FixedPoint(FixedPointBoundary.literal value, quantum)
+
+    member _.Quantum = quantum
+    member _.IsBottom = interval = Empty
+    member _.TryPoint = FixedPointBoundary.tryPoint quantum interval
+    member _.WithQuantum(newQuantum: decimal) = FixedPoint(interval, newQuantum)
+    member internal _.Interval = interval
+
+    override _.ToString() = FixedPointBoundary.format quantum interval
+
+    static member internal FromInterval(interval: Interval, quantum: decimal) =
+        FixedPoint(interval, quantum)
+
+    static member private SharedQuantum(left: FixedPoint, right: FixedPoint) =
+        if left.Quantum <> right.Quantum then
+            invalidArg "right" "Fixed-point arithmetic requires matching quanta; use WithQuantum explicitly."
+        left.Quantum
+
+    static member (+) (left: FixedPoint, right: FixedPoint) =
+        FixedPoint(
+            Interval.add left.Interval right.Interval,
+            FixedPoint.SharedQuantum(left, right))
+
+    static member (+) (left: FixedPoint, right: decimal) =
+        FixedPoint(Interval.add left.Interval (FixedPointBoundary.literal right), left.Quantum)
+
+    static member (+) (left: decimal, right: FixedPoint) =
+        FixedPoint(Interval.add (FixedPointBoundary.literal left) right.Interval, right.Quantum)
+
+    static member (-) (left: FixedPoint, right: FixedPoint) =
+        FixedPoint(
+            Interval.sub left.Interval right.Interval,
+            FixedPoint.SharedQuantum(left, right))
+
+    static member (-) (left: FixedPoint, right: decimal) =
+        FixedPoint(Interval.sub left.Interval (FixedPointBoundary.literal right), left.Quantum)
+
+    static member (-) (left: decimal, right: FixedPoint) =
+        FixedPoint(Interval.sub (FixedPointBoundary.literal left) right.Interval, right.Quantum)
+
+    static member (*) (left: FixedPoint, right: FixedPoint) =
+        FixedPoint(
+            Interval.mul left.Interval right.Interval,
+            FixedPoint.SharedQuantum(left, right))
+
+    static member (*) (left: FixedPoint, right: decimal) =
+        FixedPoint(Interval.mul left.Interval (FixedPointBoundary.literal right), left.Quantum)
+
+    static member (*) (left: decimal, right: FixedPoint) =
+        FixedPoint(Interval.mul (FixedPointBoundary.literal left) right.Interval, right.Quantum)
+
+    static member (/) (left: FixedPoint, right: FixedPoint) =
+        FixedPoint(
+            Interval.div left.Interval right.Interval,
+            FixedPoint.SharedQuantum(left, right))
+
+    static member (/) (left: FixedPoint, right: decimal) =
+        FixedPoint(Interval.div left.Interval (FixedPointBoundary.literal right), left.Quantum)
+
+    static member (/) (left: decimal, right: FixedPoint) =
+        FixedPoint(Interval.div (FixedPointBoundary.literal left) right.Interval, right.Quantum)
 
 module Transform =
     let scale (factor: float) = fun value -> value * factor
@@ -547,7 +703,9 @@ module private FiniteCore =
 
     type Table =
         { forward: uint64[]
-          reverse: uint64[] }
+          reverse: uint64[]
+          forwardFull: bool[]
+          reverseFull: bool[] }
 
     [<Struct>]
     type Arc =
@@ -605,8 +763,21 @@ module private FiniteCore =
                                     forward.[left * wordCount + right / 64] ||| (1UL <<< (right % 64))
                                 reverse.[right * wordCount + left / 64] <-
                                     reverse.[right * wordCount + left / 64] ||| (1UL <<< (left % 64))
+                    let fullRows (rows: uint64[]) =
+                        Array.init domainCount (fun value ->
+                            let offset = value * wordCount
+                            let mutable full = true
+                            let mutable word = 0
+                            while full && word < wordCount do
+                                full <- rows.[offset + word] = top.[word]
+                                word <- word + 1
+                            full)
                     let tableId = tables.Count
-                    tables.Add { forward = forward; reverse = reverse }
+                    tables.Add
+                        { forward = forward
+                          reverse = reverse
+                          forwardFull = fullRows forward
+                          reverseFull = fullRows reverse }
                     for offset in 0 .. box.arity .. box.scopes.Length - 1 do
                         let left = cellIndex.[box.scopes.[offset].id]
                         let right = cellIndex.[box.scopes.[offset + 1].id]
@@ -624,6 +795,11 @@ module private FiniteCore =
 
         let state = Array.zeroCreate<uint64> (publicCells.Length * wordCount)
         let supports = Array.zeroCreate<uint64> publicCells.Length
+        // Static no-assertion fixpoint; rebuild restores this before replaying authored premises.
+        let structuralState = Array.zeroCreate<uint64> state.Length
+        let mutable baselineState: uint64[] = null
+        let mutable baselineSupports: uint64[] = null
+        let mutable baselineValid = false
         let assertions = Dictionary<struct(int * int), uint64[]>()
         let generated = Dictionary<int, uint64[]>()
         let handlers = Dictionary<int, int -> unit>()
@@ -638,10 +814,14 @@ module private FiniteCore =
         let notify cell = for handler in handlers.Values do handler cell
         let enqueue work =
             if work >= 0 then
-                if not queuedArcs.[work] then queuedArcs.[work] <- true; queue.Enqueue work
+                if not queuedArcs.[work] then
+                    queuedArcs.[work] <- true
+                    queue.Enqueue work
             else
                 let id = -work - 1
-                if not queuedNaries.[id] then queuedNaries.[id] <- true; queue.Enqueue work
+                if not queuedNaries.[id] then
+                    queuedNaries.[id] <- true
+                    queue.Enqueue work
         let enqueueCell cell = for work in watches.[cell] do enqueue work
 
         let meetCell cell (mask: uint64[]) support =
@@ -658,20 +838,59 @@ module private FiniteCore =
                 enqueueCell cell
             changed
 
+        let meetCellWord cell mask support =
+            let offset = wordOffset cell
+            let narrowed = state.[offset] &&& mask
+            if narrowed <> state.[offset] then
+                state.[offset] <- narrowed
+                supports.[cell] <- supports.[cell] ||| support
+                notify cell
+                enqueueCell cell
+                true
+            else
+                false
+
         let candidates cell =
             [ for index in 0 .. domainCount - 1 do if hasValue cell index then yield domain.[index] ]
 
-        let fireArc id =
+        let fireArc (scratch: uint64[]) id =
             let arc = arcs.[id]
             let table = tables.[arc.table]
             let rows = if arc.reverse then table.reverse else table.forward
-            let allowed = Array.zeroCreate<uint64> wordCount
-            for value in 0 .. domainCount - 1 do
-                if hasValue arc.source value then
-                    let row = value * wordCount
-                    for word in 0 .. wordCount - 1 do
-                        allowed.[word] <- allowed.[word] ||| rows.[row + word]
-            meetCell arc.target allowed supports.[arc.source] |> ignore
+            let fullRows = if arc.reverse then table.reverseFull else table.forwardFull
+            if wordCount = 1 then
+                let mutable allowed = 0UL
+                let mutable value = 0
+                let mutable complete = false
+                while value < domainCount && not complete do
+                    if hasValue arc.source value then
+                        if fullRows.[value] then
+                            allowed <- top.[0]
+                            complete <- true
+                        else
+                            allowed <- allowed ||| rows.[value]
+                    value <- value + 1
+                meetCellWord arc.target allowed supports.[arc.source] |> ignore
+            else
+                System.Array.Clear(scratch, 0, wordCount)
+                let sourceOffset = wordOffset arc.source
+                let mutable sourceWord = 0
+                let mutable complete = false
+                while sourceWord < wordCount && not complete do
+                    let mutable bits = state.[sourceOffset + sourceWord]
+                    while bits <> 0UL && not complete do
+                        let bit = int (BitOperations.TrailingZeroCount bits)
+                        let value = sourceWord * 64 + bit
+                        bits <- bits &&& (bits - 1UL)
+                        if fullRows.[value] then
+                            System.Array.Copy(top, scratch, wordCount)
+                            complete <- true
+                        else
+                            let row = value * wordCount
+                            for word in 0 .. wordCount - 1 do
+                                scratch.[word] <- scratch.[word] ||| rows.[row + word]
+                    sourceWord <- sourceWord + 1
+                meetCell arc.target scratch supports.[arc.source] |> ignore
 
         let fireNary id =
             let relation = naries.[id]
@@ -682,11 +901,13 @@ module private FiniteCore =
                 relation.cells (List.toArray after)
 
         let quiesce () =
+            // Invocation-local ownership keeps nested propagation from observer callbacks independent.
+            let scratch = if wordCount = 1 then null else Array.zeroCreate<uint64> wordCount
             while queue.Count > 0 do
                 let work = queue.Dequeue()
                 if work >= 0 then
                     queuedArcs.[work] <- false
-                    fireArc work
+                    fireArc scratch work
                 else
                     let id = -work - 1
                     queuedNaries.[id] <- false
@@ -701,18 +922,38 @@ module private FiniteCore =
             System.Array.Clear(queuedArcs, 0, queuedArcs.Length)
             System.Array.Clear(queuedNaries, 0, queuedNaries.Length)
 
-        let setTop cell =
+        let captureBaseline () =
+            if isNull baselineState then
+                baselineState <- Array.zeroCreate<uint64> state.Length
+                baselineSupports <- Array.zeroCreate<uint64> supports.Length
+            System.Array.Copy(state, baselineState, state.Length)
+            System.Array.Copy(supports, baselineSupports, supports.Length)
+            baselineValid <- true
+
+        let restoreBaseline () =
+            if not baselineValid then invalidOp "generated baseline is not available"
+            resetQueue ()
+            for cell in 0 .. publicCells.Length - 1 do
+                let offset = wordOffset cell
+                let mutable changed = false
+                for word in 0 .. wordCount - 1 do
+                    if state.[offset + word] <> baselineState.[offset + word] then changed <- true
+                    state.[offset + word] <- baselineState.[offset + word]
+                supports.[cell] <- baselineSupports.[cell]
+                if changed then notify cell
+
+        let restoreStructural cell =
             let offset = wordOffset cell
             let mutable changed = false
             for word in 0 .. wordCount - 1 do
-                if state.[offset + word] <> top.[word] then changed <- true
-                state.[offset + word] <- top.[word]
+                if state.[offset + word] <> structuralState.[offset + word] then changed <- true
+                state.[offset + word] <- structuralState.[offset + word]
             supports.[cell] <- 0UL
             if changed then notify cell
 
         let rebuild includeGenerated =
             resetQueue ()
-            for cell in 0 .. publicCells.Length - 1 do setTop cell
+            for cell in 0 .. publicCells.Length - 1 do restoreStructural cell
             assertions
             |> Seq.sortBy (fun pair -> let struct(premise, cell) = pair.Key in premise, cell)
             |> Seq.iter (fun pair ->
@@ -720,7 +961,6 @@ module private FiniteCore =
                 meetCell cell pair.Value (1UL <<< premise) |> ignore)
             if includeGenerated then
                 generated |> Seq.sortBy _.Key |> Seq.iter (fun pair -> meetCell pair.Key pair.Value 0UL |> ignore)
-            enqueueAll ()
             quiesce ()
 
         do
@@ -729,6 +969,7 @@ module private FiniteCore =
                 System.Array.Copy(top, 0, state, offset, wordCount)
             enqueueAll ()
             quiesce ()
+            System.Array.Copy(state, structuralState, state.Length)
 
         member _.CellIndex (cell: Cell<'a>) =
             match cellIndex.TryGetValue cell.id with
@@ -741,6 +982,18 @@ module private FiniteCore =
             let mutable count = 0
             for word in 0 .. wordCount - 1 do count <- count + int (BitOperations.PopCount state.[offset + word])
             count
+        member _.SingletonValue cell =
+            let offset = wordOffset cell
+            let mutable found = -1
+            for word in 0 .. wordCount - 1 do
+                let bits = state.[offset + word]
+                if bits <> 0UL then
+                    if found >= 0 || (bits &&& (bits - 1UL)) <> 0UL then
+                        invalidOp "singleton value requested from a non-singleton cell"
+                    found <- word * 64 + int (BitOperations.TrailingZeroCount bits)
+            if found < 0 || found >= domainCount then
+                invalidOp "singleton value requested from a non-singleton cell"
+            domain.[found]
         member this.IsBottom cell = this.CandidateCount cell = 0
         member this.IsSingleton cell = this.CandidateCount cell = 1
         member _.Support cell = supports.[cell]
@@ -749,7 +1002,9 @@ module private FiniteCore =
             if premise < 0 || premise >= 64 then invalidArg "premise" "premise bitmask caps at 64"
             let key = struct(premise, cell)
             let replacing = assertions.ContainsKey key
-            assertions.[key] <- encode items
+            let encoded = encode items
+            baselineValid <- false
+            assertions.[key] <- encoded
             if replacing then rebuild true
             else
                 meetCell cell assertions.[key] (1UL <<< premise) |> ignore
@@ -757,6 +1012,7 @@ module private FiniteCore =
 
         member _.Retract premise =
             if premise < 0 || premise >= 64 then invalidArg "premise" "premise bitmask caps at 64"
+            baselineValid <- false
             let dead =
                 [ for pair in assertions do
                       let struct(found, _) = pair.Key
@@ -773,7 +1029,12 @@ module private FiniteCore =
         member _.ResetGenerated () =
             if generated.Count > 0 then
                 generated.Clear()
-                rebuild false
+                if baselineValid then restoreBaseline ()
+                else
+                    rebuild false
+                    captureBaseline ()
+            elif not baselineValid then
+                captureBaseline ()
 
         member _.Subscribe handler =
             let id = nextHandler
@@ -1151,7 +1412,8 @@ module Optimized =
     let private finiteNet (values: 'a list) (model: Model<'a> when 'a : comparison) =
         let authored = List.toArray values
         let cells = ResizeArray<Cell<'a>>(model.cells)
-        let cellIds = HashSet<int>(model.cells |> Seq.map _.id)
+        let cellPositions = Dictionary<int, int>()
+        do model.cells |> List.iteri (fun index cell -> cellPositions.Add(cell.id, index))
         let constraints = ResizeArray<Constraint<'a>>(model.constraints)
         let pending = Dictionary<struct(int * int), 'a list>()
         let mutable nextPremise = 0
@@ -1159,9 +1421,9 @@ module Optimized =
         let mutable searchPremises: int list = []
 
         let cellPosition cell =
-            cells
-            |> Seq.tryFindIndex (fun candidate -> candidate.id = cell.id)
-            |> Option.defaultWith (fun () -> invalidArg "cell" "cell does not belong to this network")
+            match cellPositions.TryGetValue cell.id with
+            | true, index -> index
+            | _ -> invalidArg "cell" "cell does not belong to this network"
 
         let requireAuthoring () =
             if engine.IsSome then invalidOp "structural authoring is closed after the network is first observed or run"
@@ -1183,14 +1445,15 @@ module Optimized =
         let addCell name =
             requireAuthoring ()
             let cell = Cell.create name
+            let position = cells.Count
             cells.Add cell
-            cellIds.Add cell.id |> ignore
+            cellPositions.Add(cell.id, position)
             cell
 
         let addConstraint constraintBox =
             requireAuthoring ()
             match constraintBox with
-            | Relation box when box.scopes |> Array.exists (fun cell -> not (cellIds.Contains cell.id)) ->
+            | Relation box when box.scopes |> Array.exists (fun cell -> not (cellPositions.ContainsKey cell.id)) ->
                 invalidArg "constraintBox" "relation contains a cell outside this network"
             | Relation _ -> constraints.Add constraintBox
             | Dataflow _ -> invalidOp "optimized finite networks do not support dataflow constraints"
@@ -1234,7 +1497,7 @@ module Optimized =
 
         let solution (built: FiniteCore.Engine<'a>) =
             cells
-            |> Seq.mapi (fun index cell -> cell, List.head (built.Candidates index))
+            |> Seq.mapi (fun index cell -> cell, built.SingletonValue index)
             |> Map.ofSeq
 
         let anyBottom (built: FiniteCore.Engine<'a>) =
@@ -1289,9 +1552,11 @@ module Optimized =
                     elif before <= 1 && after > 1 then unresolved <- unresolved + 1
                     if before = 0 && after > 0 then contradictions <- contradictions - 1
                     elif before > 0 && after = 0 then contradictions <- contradictions + 1
-                    if after > 1 then heap.Enqueue(cell, struct(after, cell))
+                    if after > 1 then
+                        heap.Enqueue(cell, struct(after, cell))
                 for cell in 0 .. cells.Count - 1 do
-                    if counts.[cell] > 1 then heap.Enqueue(cell, struct(counts.[cell], cell))
+                    if counts.[cell] > 1 then
+                        heap.Enqueue(cell, struct(counts.[cell], cell))
                 use subscription = built.Subscribe changed
                 let rec collapse () =
                     if contradictions > 0 then false

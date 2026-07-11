@@ -1085,3 +1085,202 @@ complexity was added merely to chase the historical specialized engine.
   document now retains only measurements, interpretation, and comparison caveats. Fable's earlier references
   to the proposal's original location remain unchanged as historical record. No source implementation was
   performed by this relocation.
+
+## 16. Gravity Optimization Implementation History
+
+### 16.1 Objective, controls, and measurement limits
+
+The pass began with one performance objective: reduce matching 500x500 gravity generation without making
+3-color, the cyclic WFC ladder, the established General/Optimized Sudoku benchmark, or the General live-edit
+row worse, and without changing deterministic output or propagator semantics. The contract locks were:
+
+- gravity SHA-256 `632233C0779601913FB945173CCFDD1861FA5769185DD4114BE0FA4056D7A8B2`;
+- 3-color SHA-256 `7A20D499A9E3BFC64249653EDC76CA6F7C0BE778A8F370A455910E1CBE5945FF`;
+- gravity's 1,029 SplitMix draws and zero restarts;
+- exact 8x6 row-major output, authored order, immutable public `Map`, supports, observer replay, bottom,
+  retraction/recomputation, generic universal-relation behavior, and 65/128/130-value operation;
+- historical WFC SHA-256 `836A49E4E511E23BE0A05A598403EBFE2E9512B1C1F82583B1FA8498FD357621`.
+
+The machine remained on the Power saver plan under .NET 9.0.12. Its sustained timings degraded markedly
+through the session, so each full checkpoint kept benchmark order fixed and interpreted gravity beside
+3-color, the cyclic ladder, and the Sudoku/live-edit controls from that process. These are sequential
+candidate checkpoints, not final-tree ablations: the final tree was not rebuilt and rerun with each retained
+candidate independently disabled. Mechanical counts and allocations therefore provide the strongest
+candidate attribution; absolute cross-process milliseconds are retained as observations rather than treated
+as controlled deltas.
+
+The timed current-surface finite rows were the established portable binary-relation 4x4 Sudoku with eight
+givens through General and Optimized, plus the retained General two-assert/two-retract live-edit cycle.
+Friendly, sparse, and generic-representation Sudokus and the scalar, interval, affine, barometer, provenance,
+observer, and guard fixtures ran as correctness gates; they have no individual timing precedent and were not
+invented as new benchmarks here. Older Part-1 and mutable-core Sudoku timings belong to separate unchanged
+historical implementations and were not rerun.
+
+### 16.2 Baseline and diagnosis
+
+A canonical oracle encoded little-endian width, height, tile count, and explicit row-major tile bytes before
+SHA-256. The literal 8x6 oracle and both 500x500 fingerprints passed before mechanics changed. Temporary
+private diagnostics were enabled without adding any Friendly operation. Baseline gravity contained 250,000
+cells, two compiled relation tables, 998,000 directed arcs, and 998,000 watch entries. Initial generation
+fired 998,000 arcs and allocated 998,000 one-word `fireArc` arrays. Repeat generation performed another full
+998,000-arc reset/rebuild before search. Output construction also proved material: candidate-list extraction
+and immutable `Map` construction allocated about 298.5 MB in the instrumented run.
+
+The fixed-order Phase 0 process measured General Sudoku at 33,726.2 / 39,027.3 us, Optimized Sudoku at
+1,369.2 / 2,439.1 us, and General live edit at 36.5 / 48.6 us (best / mean), a 24.63x best-time Sudoku
+ratio. Cyclic 500x500 took 12,011.427 ms; matching gravity took 4,544.909 / 4,929.444 ms and matching
+3-color 6,203.318 / 6,526.135 ms. All correctness gates passed.
+
+### 16.3 Choices and outcomes
+
+| candidate | implementation and evidence | measured checkpoint | decision |
+|---|---|---|---|
+| 0 - cell lookup | Replaced `Seq.tryFindIndex` plus the redundant id set with one incrementally maintained `Dictionary<int,int>`. Initial cells, added cells, and relations over added cells passed. A 100,000-cell read sweep took 101.539 ms. | One-trial matching check: gravity 4,704.256 ms; 3-color 5,427.033 ms; both hashes exact. Generation was not the target of this candidate. | Retained. Direct removal of accidental quadratic aggregate reads. |
+| 1 - universal WFC direction | `Grid` retained its validated tile array and checked all ordered pairs before constructing scopes. Gravity's universal east direction was omitted only in the WFC file. Generic core universal relations remained real because empty-source bottom transmission is observable. Tables fell 2 -> 1; arcs and watches fell 998,000 -> 499,000. A test-local explicit-east route and the elided route produced identical complete maps; draws stayed 1,029 and restarts zero. | Full checkpoint: cyclic 500x500 12,463.005 ms; gravity 4,078.417 / 5,093.959 ms; 3-color 7,878.721 / 8,062.427 ms. Finite ratio 51.56x. Severe late-run spread, including 128x128 cyclic at 2,789.524 ms, prevented attribution from milliseconds alone; structural counts and fingerprint were decisive. | Retained. WFC-local authoring simplification with exact behavior. |
+| 2 - settled baseline | Added one lazy snapshot of the existing engine's quiescent candidate words and supports. Assert, same-premise replacement, and retract invalidate before mutation. Generated reset restores the snapshot, clears queue flags, and notifies only visibly changed cells; it does not cache constraints, assertions, queues, or a second model. Fresh-twin tests covered assertion, retraction, and replacement between two `Generate` calls; a retained observer and odd-cycle failed-attempt/restart case passed. | Comparable gravity profile reset fell 266.907 -> 21.648 ms initially and measured 29.172 ms at the next combined checkpoint; reset allocation became zero and 499,000 reset arcs disappeared. Full checkpoint: cyclic 500x500 8,099.838 ms; gravity 4,078.752 / 4,141.916 ms; 3-color 6,044.318 / 7,898.973 ms. Finite ratio 46.15x. | Retained after the dedicated cache review gate. |
+| 3 - binary arc loop | Added a scalar `uint64` branch inside the same runtime-width engine and precomputed full-row flags. No sibling backend or shared scratch was introduced, so observer re-entry gained no scratch-corruption hazard. Empty sources still transmit bottom. Asymmetric 65-value and 65/128/130-value cases, full-row behavior, supports, reverse propagation, and observers passed. | One-word `fireArc` arrays fell from 998,000 per repeat after Candidate 1 (1,996,000 in the original repeat profile) to zero. Full checkpoint: cyclic 500x500 3,842.648 ms; gravity 1,057.193 / 1,196.598 ms; 3-color 1,228.796 / 1,311.783 ms. Finite ratio 43.29x. | Retained. Largest demonstrated shared-path win; gravity and 3-color both improved. |
+| 4 - picker | Profile showed gravity picker initialization near 15 ms, 4,711 stale dequeues, and only 1,029 guesses. Initial priorities are already inserted in increasing cell-id order, so bulk construction offered little expected gain; an indexed heap would add substantial state and proof burden. | No implementation or timing delta. This was intentionally stopped before code. | Skipped for lack of evidence. |
+| 5 - singleton extraction | Added private `SingletonValue`, using `BitOperations` and failing on zero or multiple candidates. Generation still returns the same immutable `Map` in authored cell order. | Instrumented gravity extraction fell 260.486 -> 57.601 ms and output allocation about 298.5 -> 270.5 MB. The late final full process measured cyclic 500x500 12,087.915 ms; gravity 3,569.262 / 4,445.822 ms; 3-color 3,941.998 / 4,584.026 ms; finite ratio 50.80x. All controls slowed together after the long session, so the extraction counters, allocation delta, and exact outputs are the candidate evidence. | Retained. Removes lists without changing the result contract. |
+| 6 - layout | After scalar arcs, measured propagation no longer dominated; immutable `Map` construction was the principal residual. Flattening watches, adding support counters, or creating grid storage would complicate the core without evidence. | No implementation or timing delta. | Skipped. The immutable `Map` is the stopping boundary for this pass. |
+
+### 16.4 Failures and corrections
+
+The work encountered three concrete failures. The new baseline-refresh regression initially failed to compile
+because F# could not infer the Friendly network type at `net.Value`/`net.Support`; adding the explicit
+`Network<int,int,Set<int>>` annotation fixed the test, after which all cache sequences passed. The full-row
+precomputation initially failed to compile because the support-row parameter type was indeterminate; an
+explicit `uint64[]` annotation fixed it, after which all one-word and multiword tests passed. Neither was a
+runtime semantic failure.
+
+The first final historical run hit the five-minute command timeout after 301.9 seconds. It had already passed
+all correctness checks and completed propagation/retraction timing, but had not reached full-map generation,
+so it was recorded as incomplete rather than treated as a failure or quoted selectively. A second run with a
+larger timeout completed in 444.6 seconds. It passed every correctness row and measured reset W=8 9.780 ms,
+ramp512 corner 5,722.003 ms, ramp128 center 137.628 ms, reset W=1 2.463 ms, gravity column 2.635 ms,
+gravity-small cone/replay 1.961/1.334 ms, ramp512-large cone/replay 7,658.648/5,393.498 ms, gravity
+generation 292.197 ms, 3-color generation 55,390.970 ms, and ramp32 generation 161.740 ms. The historical
+hash and empty git diff were rechecked afterward.
+
+Temporary profiling itself imposed substantial overhead, especially the per-union counters, and one paired
+profile took 96 seconds. Its wall times were never used as production benchmark claims. Once the useful
+operation and allocation evidence had been collected, all profiling fields, environment switches, counter
+branches, and profile-only WFC mode were removed. The full correctness and benchmark suites passed again on
+the production path.
+
+### 16.5 Direct comparison with preceding records
+
+The applicable preceding values are repeated here so the outcome can be read without consulting older
+benchmark sections.
+
+| established current-surface row | immediate pre-session best / mean | final best / mean | result |
+|---|---:|---:|---|
+| General binary-relation 4x4 Sudoku | 32,651.1 / 36,149.4 us | 31,483.6 / 195,034.4 us | Best improved 3.6%; final mean is a late-session outlier on unchanged General code. |
+| Optimized identical Sudoku | 1,001.6 / 2,506.6 us | 619.8 / 1,491.8 us | Best improved 38.1%; mean improved 40.5%. |
+| General two-assert/two-retract live edit | 27.9 / 38.4 us | 32.1 / 43.8 us | 15.1% slower by best, within observed spread and faster than this session's Phase 0 row. |
+
+| matching WFC workload | prior historical best | completed historical rerun | immediate pre-session Friendly best | strongest retained checkpoint | final late Friendly | direct comparison |
+|---|---:|---:|---:|---:|---:|---|
+| gravity 500x500 | 363.597 ms | 292.197 ms | 5,959.679 ms | 1,057.193 ms | 3,569.262 ms | Historical remains 3.62x faster than the strongest checkpoint and 12.21x faster than the final late sample; Friendly improved 5.64x at its strongest checkpoint versus its immediate prior record. |
+| 3-color 500x500 | 54,743.329 ms | 55,390.970 ms | 4,958.214 ms | 1,228.796 ms | 3,941.998 ms | Friendly is 45.08x faster than the historical rerun at its strongest checkpoint and 14.05x faster in the final late sample; strongest Friendly improved 4.03x versus its immediate prior record. |
+
+There is no historical cyclic workload, so cyclic 500x500 is compared only with its own Phase 0 value:
+12,011.427 ms -> 3,842.648 ms at the strongest checkpoint, followed by the degraded 12,087.915 ms final
+sample. Historical ramp timings were rerun and preserved, but no equivalent ramp workload was timed through
+the changed Friendly/optimized core; the generic multiword correctness tests do not fill that performance
+gap.
+
+### 16.6 Final choice
+
+Retain Candidates 0, 1, 2, 3, and 5. They are direct, orthogonal reductions in demonstrated work and preserve
+the exact outputs and general propagator laws. Leave Candidates 4 and 6 unimplemented. Do not change the
+public immutable `Map`, add WFC vocabulary to core, introduce a second finite engine, or expose mechanics
+through Friendly merely to approach the historical gravity-specialized `int[]` path.
+
+The strongest clean checkpoint reduced matching gravity from the Phase 0 observation of 4,544.909 ms best
+to 1,057.193 ms while matching 3-color improved from 6,203.318 to 1,228.796 ms and cyclic 500x500 from
+12,011.427 to 3,842.648 ms. The much later final process was slower in every WFC control but still retained
+exact hashes and a 50.80x Optimized/General Sudoku ratio. This is why the final judgment rests on the full
+checkpoint series plus removed arc/reset/allocation counts, not on selecting either the fastest or latest
+absolute sample. Detailed timing tables remain in `benchmarks.md`.
+
+-- Codex, 2026-07-11
+
+## 17. Ramp Measurement and Multiword Rebuild History
+
+### 17.1 Scope and authoring boundary
+
+This pass closed the explicit gap left by section 16: run the historical ramp shapes through the changed
+Friendly/Optimized core without placing grid, tile, ramp, or WFC policy in the library. The app-local grid was
+made generic over its tile type and gained only WFC-facing conveniences for cell lookup, named assumptions,
+retraction, value, and support. Integer ramp models then use the same `Grid.create`, `Grid.constrain`,
+`Grid.assume`, `Grid.retract`, and `Grid.generate` vocabulary as the earlier tile examples. Friendly itself
+and its one-authority delegation record did not change.
+
+The correctness lock reproduces the historical small models: one pin across a 100-value domain, the 64-bit
+word seam, two pins forcing every value, exact OR-on-narrow support names, assert-site bottom, and retraction
+against a fresh surviving-premise twin. The large timing gate checks the same 500x500 ramp512 corner and
+ramp128 center counts, the opposite-corner ramp512 edit, and a valid 64x64 ramp32 generated map. The current
+ramp32 result fingerprint is
+`3AD38489B2BB9D6165F761FAF7881C838EF338286F031B60C6419A6555C2FDAD`.
+
+### 17.2 Diagnosis and retained changes
+
+The first current-core run measured ramp512 corner at 19,614.021 ms, ramp128 center at 2,563.402 ms,
+ramp512 retraction at 23,636.274 ms, and ramp32 generation at 186.608 ms. The large propagation gap exposed
+the conditional multiword work deferred by Candidate 3, but its dominant cause was broader than scratch
+allocation.
+
+1. Multiword `fireArc` allocated a fresh accumulator for every arc. It now allocates one scratch array per
+   `quiesce` invocation and clears it between firings. Nested observer-triggered propagation owns a separate
+   invocation and therefore a separate buffer. A 65-value observer re-entry regression performs a nested
+   assertion and checks final values plus OR-on-narrow support.
+2. Multiword arcs tested all authored values. They now enumerate set bits word by word with
+   `TrailingZeroCount`, retaining the same flattened forward/reverse tables and full-row shortcut.
+3. Rebuild was the dominant issue. Replacing an assertion or retracting a premise reset every cell to top,
+   enqueued every arc, and recomputed the whole structural fixpoint. The engine now snapshots its one
+   constraint-only quiescent state at construction. Rebuild restores that immutable derived state, clears
+   support, applies the authoritative assertion registry, and propagates only from cells actually narrowed.
+   This is not a second mutable model: constraints and assertions remain the only authority, and the snapshot
+   contains only their static no-assertion fixpoint. Relations that remove unsupported values from top remain
+   correct because the restored state is the computed structural fixpoint, not an assumed all-top state.
+
+### 17.3 Sequential checkpoints and controls
+
+The one-trial checkpoints were sequential and ran under the repository's known machine drift. They are not
+strict independent final-tree ablations.
+
+| checkpoint | ramp512 corner | ramp128 center | ramp512 retract | ramp32 generation |
+|---|---:|---:|---:|---:|
+| initial | 19,614.021 ms | 2,563.402 ms | 23,636.274 ms | 186.608 ms |
+| scratch | 17,427.153 ms | 2,898.273 ms | 22,929.159 ms | 238.842 ms |
+| set-bit iteration | 19,794.289 ms | 1,738.741 ms | 24,938.788 ms | 407.618 ms |
+| structural baseline | 6,256.278 ms | 156.072 ms | 6,010.373 ms | 332.095 ms |
+| final fixed-order process | 6,469.697 ms | 182.009 ms | 6,822.673 ms | 305.038 ms |
+
+The structural checkpoint reduced ramp512 3.16x and ramp128 11.14x relative to the immediately preceding
+checkpoint. Against the completed historical rerun, the final Friendly rows are 1.13x slower on ramp512 and
+1.32x slower on ramp128. Current retraction is 1.12x faster than the historical cone-local row but 1.27x
+slower than historical full replay; the mechanisms differ, so replay is the closer comparison. Ramp32
+generation is 1.89x slower, with the existing result/RNG/search-policy caveat.
+
+The final fixed-order WFC process also measured cyclic 500x500 at 4,167.414 ms, gravity at 1,338.347 ms,
+and 3-color at 1,324.329 ms. Both established 500x500 fingerprints remained exact. The adjacent finite run
+measured General/Optimized Sudoku at 38,748.9/994.7 us best and General live edit at 31.9 us best, a 38.95x
+same-run Sudoku ratio. All scalar, interval, provenance, sparse-search, 65/128/130-value, asymmetric relation,
+full-row, bottom, baseline-refresh, restart, observer, and retraction regressions passed.
+
+### 17.4 Corrections and decision
+
+The new nested-observer test initially expected the nested premise to appear on an already-singleton middle
+cell. That contradicted the established OR-on-narrow law: no second narrowing means no second support join.
+The oracle was corrected to `{outer}` for the middle and `{nested}` for the independently narrowed right
+cell. No implementation behavior changed to satisfy the test, and no runtime semantic gate failed.
+
+Retain invocation-local multiword scratch, set-bit source iteration, and the immutable structural rebuild
+baseline. They are general finite-propagator machinery, reduce demonstrable work, preserve synchronous
+observation and Sussman-style propagation laws, and add no public vocabulary. Do not import the historical
+grid-shaped queue, cone-local WFC retraction, or AC-4 support counters into core on this evidence. The current
+generic implementation is within 13-32 percent of the specialized historical propagation rows while keeping
+one coherent arbitrary-relation engine.
+
+-- Codex, 2026-07-11

@@ -299,6 +299,82 @@ module private FriendlyRegression =
             return! fun net -> net.Value celsius, net.Value fahrenheit
         }
 
+    let private verifyFixedPointSurface () =
+        let inferredHundredths = FixedPoint(12.50m)
+        require (inferredHundredths.Quantum = 0.01m) "core fixed-point scale inference regression"
+        let mismatchedQuantumRejected =
+            let other = FixedPoint(1.2m)
+            [ (fun () -> inferredHundredths + other)
+              (fun () -> inferredHundredths - other)
+              (fun () -> inferredHundredths * other)
+              (fun () -> inferredHundredths / other) ]
+            |> List.forall (fun operation ->
+                try
+                    operation () |> ignore
+                    false
+                with :? System.ArgumentException ->
+                    true)
+        require
+            mismatchedQuantumRejected
+            "core fixed-point mismatched-quantum rejection regression"
+        require
+            ((inferredHundredths.WithQuantum(0.1m) + FixedPoint(1.2m)).Quantum = 0.1m)
+            "core fixed-point explicit quantum reconciliation regression"
+        let operatorInterop =
+            let value = FixedPoint(2.00m)
+            [ value + 3m; 3m + value
+              value - 3m; 3m - value
+              value * 3m; 3m * value
+              value / 3m; 3m / value ]
+        require
+            (operatorInterop |> List.forall (fun value -> not value.IsBottom && value.Quantum = 0.01m))
+            "core fixed-point decimal operator interop regression"
+
+        let net = Domain.fixedPoint 0.1m
+        let celsius = net.Cell "fixed-C"
+        let fahrenheit = net.Cell "fixed-F"
+        net.Convert(
+            celsius,
+            fahrenheit,
+            (fun value -> value * 9m / 5m + 32m),
+            (fun value -> (value - 32m) * 5m / 9m))
+        net.Assume("reading", celsius, FixedPoint(1.0m))
+        require
+            ((net.Value celsius).TryPoint = Some 1m
+             && (net.Value fahrenheit).TryPoint = Some 33.8m)
+            "core fixed-point operator-authored propagation regression"
+        net.Assume("conflict", fahrenheit, FixedPoint(100.0m))
+        require
+            ((net.Value fahrenheit).IsBottom
+             && net.ShowSupport(net.Support fahrenheit) = "{reading, conflict}")
+            "core fixed-point genuine-conflict regression"
+        net.Retract "conflict"
+        require
+            ((net.Value fahrenheit).TryPoint = Some 33.8m
+             && net.ShowSupport(net.Support fahrenheit) = "{reading}")
+            "core fixed-point retraction regression"
+
+        let sweep count assertCelsius =
+            [ 0 .. count ]
+            |> List.forall (fun tick ->
+                let expected = decimal tick / 10m
+                let sweepNet = Domain.fixedPoint 0.1m
+                let sweepC = sweepNet.Cell "sweep-C"
+                let sweepF = sweepNet.Cell "sweep-F"
+                sweepNet.Convert(
+                    sweepC,
+                    sweepF,
+                    (fun value -> value * 9m / 5m + 32m),
+                    (fun value -> (value - 32m) * 5m / 9m))
+                let asserted = if assertCelsius then sweepC else sweepF
+                sweepNet.Given(asserted, FixedPoint(expected, 0.1m))
+                not (sweepNet.Value sweepC).IsBottom
+                && not (sweepNet.Value sweepF).IsBottom
+                && (sweepNet.Value asserted).TryPoint = Some expected)
+        require (sweep 2000 true) "core fixed-point Celsius sweep regression"
+        require (sweep 1800 false) "core fixed-point Fahrenheit sweep regression"
+        net.Value celsius, net.Value fahrenheit
+
     let private g = Interval.pt 9.8
     let private half = Interval.pt 0.5
     let private two = Interval.pt 2.0
@@ -463,6 +539,8 @@ module private FriendlyRegression =
         let intervalC, intervalF = demoCelsiusInterval ()
         require (intervalC <> Empty && intervalF <> Empty) "interval conversion regression"
         printfn "  interval: C = %s, F = %s" (showInterval intervalC) (showInterval intervalF)
+        let fixedC, fixedF = verifyFixedPointSurface ()
+        printfn "  fixed point: C = %O, F = %O" fixedC fixedF
         demoBarometer ()
         let solved, grid = demoSudoku ()
         let expected = [| [|1;2;3;4|]; [|3;4;1;2|]; [|2;1;4;3|]; [|4;3;2;1|] |]
@@ -679,6 +757,145 @@ module private FiniteCoreRegression =
         && Set.isEmpty (Optimized.support net right)
         && events = beforeRetraction
 
+    let incrementalCellLookup () =
+        let initial = Cell.create "lookup-initial"
+        let model =
+            { domain = Domain.finite [ 2; 1 ]
+              cells = [ initial ]
+              constraints = []
+              givens = [] }
+        let net = lowerOptimized model
+        let addedLeft = Optimized.cell net "lookup-added-left"
+        let addedRight = Optimized.cell net "lookup-added-right"
+        Optimized.constrain net
+            (Constraint.relations
+                [ [ initial; addedLeft ]; [ addedLeft; addedRight ] ]
+                (function [ left; right ] -> left = right | _ -> false))
+        Optimized.assume net initial 1 |> ignore
+        [ initial; addedLeft; addedRight ]
+        |> List.forall (fun cell -> Optimized.value net cell = FiniteCandidates [ 1 ])
+
+    let readSweep count =
+        let net = Optimized.createFinite [ 0; 1 ]
+        let cells = Array.init count (fun index -> Optimized.cell net (sprintf "read-%d" index))
+        Optimized.value net cells.[0] |> ignore
+        let timer = Stopwatch.StartNew()
+        for cell in cells do Optimized.value net cell |> ignore
+        timer.Stop()
+        timer.Elapsed.TotalMilliseconds
+
+    let settledBaselineRefresh () =
+        let makeNetwork () =
+            let net = ``Propagator-friendly``.Domain.finite [ 1; 2; 3 ]
+            let cells = List.init 4 (fun index -> net.Cell(sprintf "baseline-%d" index))
+            net.RelateMany(
+                cells |> List.pairwise |> List.map (fun (left, right) -> [ left; right ]),
+                function [ left; right ] -> left <> right | _ -> false)
+            net, cells
+        let values cells result =
+            result |> Result.map (fun solution -> cells |> List.map (fun cell -> Map.find cell solution))
+        let visible (net: ``Propagator-friendly``.Network<int, int, Set<int>>) cells =
+            cells |> List.map (fun cell -> net.Value cell, net.Support cell)
+        let compareEdited editCurrent editFresh =
+            let current, currentCells = makeNetwork ()
+            let fresh, freshCells = makeNetwork ()
+            let replay = Dictionary<Cell<int>, CellState<int>>()
+            use subscription = current.Observe(fun (cell, state) -> replay.[cell] <- state)
+            editCurrent current currentCells
+            let currentResult = current.Generate 42UL
+            editFresh fresh freshCells
+            let freshResult = fresh.Generate 42UL
+            values currentCells currentResult = values freshCells freshResult
+            && visible current currentCells = visible fresh freshCells
+            && match currentResult with
+               | Ok solution ->
+                   replay.Count = currentCells.Length
+                   && replay
+                      |> Seq.forall (fun pair ->
+                          match pair.Value with
+                          | FiniteCandidates [ value ] -> Map.find pair.Key solution = value
+                          | _ -> false)
+               | Error _ -> false
+        let assumeBetween =
+            compareEdited
+                (fun net cells ->
+                    net.Generate 42UL |> ignore
+                    net.Assume("edit", List.head cells, 2))
+                (fun net cells -> net.Assume("edit", List.head cells, 2))
+        let retractBetween =
+            compareEdited
+                (fun net cells ->
+                    net.Assume("edit", List.head cells, 1)
+                    net.Generate 42UL |> ignore
+                    net.Retract "edit")
+                (fun _ _ -> ())
+        let replaceBetween =
+            compareEdited
+                (fun net cells ->
+                    net.Assume("edit", List.head cells, 1)
+                    net.Generate 42UL |> ignore
+                    net.Assume("edit", List.head cells, 2))
+                (fun net cells -> net.Assume("edit", List.head cells, 2))
+        let failedRestartRestoresBaseline =
+            let net = ``Propagator-friendly``.Domain.finite [ 1; 2 ]
+            let cells = List.init 3 (fun index -> net.Cell(sprintf "odd-cycle-%d" index))
+            net.RelateMany(
+                [ [ cells.[0]; cells.[1] ]; [ cells.[1]; cells.[2] ]; [ cells.[2]; cells.[0] ] ],
+                function [ left; right ] -> left <> right | _ -> false)
+            let replay = Dictionary<Cell<int>, CellState<int>>()
+            use subscription = net.Observe(fun (cell, state) -> replay.[cell] <- state)
+            net.Generate(7UL, 3) = Error (RestartLimitExceeded 3)
+            && (cells |> List.forall (fun cell -> net.Value cell = Set.ofList [ 1; 2 ] && Set.isEmpty (net.Support cell)))
+            && replay.Count = cells.Length
+            && (replay.Values |> Seq.forall ((=) (FiniteCandidates [ 1; 2 ])))
+        assumeBetween && retractBetween && replaceBetween && failedRestartRestoresBaseline
+
+    let binaryHotPathEdges () =
+        let fullNet = ``Propagator-friendly``.Domain.finite [ 0; 1; 2 ]
+        let fullSource = fullNet.Cell "full-source"
+        let fullTarget = fullNet.Cell "full-target"
+        fullNet.Relate(
+            [ fullSource; fullTarget ],
+            function [ source; _ ] -> source = 0 | _ -> false)
+        fullNet.Restrict("source", fullSource, Set.singleton 0)
+        let fullRowPreservesTop =
+            fullNet.Value fullTarget = Set.ofList [ 0; 1; 2 ]
+            && Set.isEmpty (fullNet.Support fullTarget)
+
+        let emptyNet = ``Propagator-friendly``.Domain.finite [ 0; 1; 2 ]
+        let emptySource = emptyNet.Cell "empty-source"
+        let emptyTarget = emptyNet.Cell "empty-target"
+        emptyNet.Relate(
+            [ emptySource; emptyTarget ],
+            function [ source; target ] -> source = target | _ -> false)
+        emptyNet.Restrict("empty", emptySource, Set.empty)
+        let emptySourceTransmitsBottom =
+            Set.isEmpty (emptyNet.Value emptyTarget)
+            && emptyNet.ShowSupport(emptyNet.Support emptyTarget) = "{empty}"
+        fullRowPreservesTop && emptySourceTransmitsBottom
+
+    let multiwordObserverReentry () =
+        let net = ``Propagator-friendly``.Domain.finite [ 0 .. 64 ]
+        let left = net.Cell "reentry-left"
+        let middle = net.Cell "reentry-middle"
+        let right = net.Cell "reentry-right"
+        net.RelateMany(
+            [ [ left; middle ]; [ middle; right ] ],
+            function [ first; second ] -> first = second | _ -> false)
+        let mutable armed = false
+        use subscription =
+            net.Observe(middle, fun (_, state) ->
+                if armed && state = FiniteCandidates [ 42 ] then
+                    armed <- false
+                    net.Assume("nested", right, 42))
+        armed <- true
+        net.Assume("outer", left, 42)
+        [ left; middle; right ]
+        |> List.forall (fun cell -> net.Value cell = Set.singleton 42)
+        && net.ShowSupport(net.Support middle) = "{outer}"
+        && net.ShowSupport(net.Support right) = "{nested}"
+        && not armed
+
     let run () =
         groupedEquivalence ()
         && wideDomains ()
@@ -689,6 +906,10 @@ module private FiniteCoreRegression =
         && restartFailure ()
         && premiseGuard ()
         && liveRetractionAndDisposal ()
+        && incrementalCellLookup ()
+        && settledBaselineRefresh ()
+        && binaryHotPathEdges ()
+        && multiwordObserverReentry ()
 
 let main () =
     printfn "runtime: %s" (System.Runtime.InteropServices.RuntimeInformation.FrameworkDescription)
@@ -902,6 +1123,12 @@ let main () =
         printfn "  Optimized lower+solve:   %.1f / %.1f us" optimizedBest optimizedMean
         printfn "  General live edit cycle: %.1f / %.1f us" editBest editMean
         printfn "  Optimized/General speedup: %.2fx" (generalBest / optimizedBest)
+        printfn ""
+    if ok && fsi.CommandLineArgs |> Array.contains "--benchmark-read-sweep" then
+        let count = 100000
+        let elapsed = FiniteCoreRegression.readSweep count
+        printfn "== optimized aggregate read sweep =="
+        printfn "  %d cells read once: %.3f ms" count elapsed
         printfn ""
     printfn "RESULT: %s" (if ok then "PASS (differential, live edits, and capability witnesses correct)" else "FAIL")
     if ok then 0 else 1

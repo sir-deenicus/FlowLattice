@@ -1115,6 +1115,66 @@ immutable `Map` and uses stable SplitMix restart generation. Exact numbers and s
 
 -- Codex, 2026-07-11
 
+**Codex current suggestion, 2026-07-11 - retain the measured direct finite optimizations and stop at the
+immutable result boundary.** Profiling located five independent costs worth removing: linear facade cell
+lookup, WFC authoring of a universal direction, replay of the same settled pre-generation state, per-arc
+one-word arrays, and solved-cell candidate lists. Their replacements remain small and orthogonal: one
+maintained position dictionary, a WFC-local universality check, one snapshot of the existing engine's
+candidate/support arrays, a scalar branch inside the same runtime-width engine, and direct singleton lookup.
+No WFC noun or mechanic entered core, and Friendly gained no backend vocabulary or second mutable authority.
+
+The exact gravity and 3-color fingerprints, gravity draw/restart sequence, authored order, supports,
+synchronous observation, retraction/recomputation, empty-source bottom propagation, and 65/128/130-value
+behavior all remained fixed. The established General/Optimized binary-relation Sudoku timings and General
+live-edit timing were carried through every full checkpoint; other Sudoku and tutorial fixtures remain
+correctness-only because they have no individual timing precedent. Sequential timing varied heavily on the
+Power saver machine, so candidate decisions use arc/reset/allocation evidence plus full control runs rather
+than pretending the checkpoints are strict final-tree ablations.
+
+The immediate comparisons are: Optimized Sudoku improved from 1,001.6 to 619.8 us best while General best
+remained stable (32,651.1 to 31,483.6 us); matching gravity improved from the prior Friendly 5,959.679 ms
+to 1,057.193 ms at the strongest checkpoint, though the historical rerun remained faster at 292.197 ms;
+matching 3-color improved from 4,958.214 to 1,228.796 ms and remained far faster than historical
+55,390.970 ms. Cyclic has no historical counterpart. Its own 500x500 row moved 12,011.427 to 3,842.648 ms
+at the strongest checkpoint before a late-session 12,087.915 ms sample tracked the machine-wide slowdown.
+Historical ramp rows were preserved, but no equivalent ramp performance row was run through the changed
+core; that is the next explicit measurement gap rather than an implied success.
+
+Do not add a custom picker, flattened arc layout, alternate result type, or WFC-specialized core engine on
+the current evidence. Picker work was too small to justify an indexed heap, and after the retained changes
+the principal residual was immutable `Map` construction. Changing that public result is a separate surface
+decision. The complete candidate table, failures, timings, and final rationale are retained in the
+[Generalized Finite Face and WFC Application Plan](propagator-finite-face-plan.md); the full benchmark ledger
+is in [benchmarks.md](benchmarks.md).
+
+-- Codex, 2026-07-11
+
+**Codex current suggestion, 2026-07-11 - retain the generic structural-fixpoint rebuild and close the ramp
+measurement gap.** Ramp now authors 32-, 100-, 128-, and 512-value integer domains through the same app-local
+generic `Grid` and Friendly operations as the earlier WFC examples. The historical small-domain laws,
+multiword seam, support, bottom, retraction, and large-grid spot checks all pass. No WFC noun, grid mechanic,
+or alternate relation form entered core or Friendly.
+
+The measured core issue was general: assertion replacement and retraction restored raw top and enqueued every
+relation arc, even when the authored edit could affect only a local wave. The optimized engine now restores
+its immutable constraint-only fixpoint, then applies the authoritative assertion registry and propagates from
+actual narrowings. Multiword arcs also reuse invocation-local scratch and enumerate set bits. Nested observer
+propagation remains safe because each `quiesce` invocation owns its buffer. This remains one mutable network,
+not a cached second model.
+
+In the final fixed-order process, ramp512 corner measured 6,469.697 ms versus historical 5,722.003 ms, and
+ramp128 center measured 182.009 ms versus 137.628 ms. The current rows are therefore 1.13x and 1.32x slower,
+respectively, rather than the initial current-core 19,614.021 and 2,563.402 ms. Cyclic 500x500 measured
+4,167.414 ms; gravity and 3-color measured 1,338.347 and 1,324.329 ms with exact fingerprints. The adjacent
+finite controls retained a 38.95x Optimized/General Sudoku ratio and a 31.9 us General live-edit best.
+
+Keep the direct generic changes. Do not add grid-shaped queues, cone-local WFC mechanics, or AC-4 counters to
+core without new cross-workload evidence. Full measurements and sequential-ablation caveats are in
+[benchmarks.md](benchmarks.md); implementation reasoning is in section 17 of the
+[Generalized Finite Face and WFC Application Plan](propagator-finite-face-plan.md).
+
+-- Codex, 2026-07-11
+
 ## 11. Dated history
 
 - **2026-07-05 - Codex.** Added the current suggestion above: provisionally accept write-once authoring,
@@ -1406,6 +1466,27 @@ immutable `Map` and uses stable SplitMix restart generation. Exact numbers and s
   change; candidate 3's shared scratch needs an observer re-entrancy stance first; candidate 2's cached
   baseline is the riskiest item and needs an assert/retract-between-generates refresh test. Optimization
   work may proceed on the proposal as written.
+
+- **2026-07-11 - Codex (gravity optimization work order completed).** Began by locking exact row-major and
+  SHA-256 output, then profiled construction, reset, propagation, picker, extraction, and `Map` construction.
+  Retained the cell-position dictionary, WFC-local universal-direction elision, one-authority settled
+  state/support cache, scalar one-word arc path, precomputed full-row flags, and direct singleton extraction.
+  Skipped custom picker and arc-layout machinery for lack of measured payoff. Two F# type-inference failures
+  during test/helper additions were corrected with explicit annotations; no semantic gate failed. The first
+  historical run timed out before generation and was discarded as incomplete; the larger-timeout rerun
+  completed all rows, passed correctness, and remained byte-identical. Both 500x500 fingerprints and all
+  finite, multiword, provenance, observer, retraction, and restart tests passed. The rewritten
+  [finite-face record](propagator-finite-face-plan.md) contains the candidate decision table and limitations;
+  [benchmarks.md](benchmarks.md) contains every established current Sudoku/live-edit timing, the full cyclic
+  ladder, matching WFC checkpoints, candidate evidence, and completed historical timing table.
+
+- **2026-07-11 - Codex (Friendly ramp gap closed).** Generalized only the WFC application's local grid wrapper
+  so integer ramp domains use the existing Friendly surface, then added exact small ramp laws and opt-in
+  500x500/64x64 timing. The first run exposed per-arc multiword allocation, absent-value scans, and especially
+  global arc replay during rebuild. Retained invocation-local scratch, set-bit iteration, and an immutable
+  constraint-only structural baseline; added nested observer re-entry coverage. Final ramp512/ramp128 rows
+  were within 1.13x/1.32x of the specialized historical rerun while all finite and WFC controls remained
+  correct. Detailed checkpoints and comparison boundaries were appended rather than rewriting prior history.
 
 ## 12. The dependency boundary and the observation split
 

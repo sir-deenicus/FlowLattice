@@ -385,3 +385,205 @@ shuffles and trail-backed DFS, and was recorded with one measured trial; Friendl
 immutable `Map`, uses stable SplitMix uniform choices with bounded restart, and reports two measured trials.
 The runs were separate Power-saver processes on different dates. Therefore the ratios describe these
 observations and the strong workload reversal; they are not stable cross-machine speedup claims.
+
+---
+
+## 2026-07-11 addendum - gravity optimization execution
+
+The accepted work order was executed under .NET 9.0.12 on the Power saver plan. Every full checkpoint ran
+the complete correctness suite before timing. The locked seed-42 outputs remained:
+
+- gravity: `632233C0779601913FB945173CCFDD1861FA5769185DD4114BE0FA4056D7A8B2`;
+- 3-color: `7A20D499A9E3BFC64249653EDC76CA6F7C0BE778A8F370A455910E1CBE5945FF`.
+
+Gravity retained 1,029 draws and zero restarts. Historical WFC remained byte-identical at
+`836A49E4E511E23BE0A05A598403EBFE2E9512B1C1F82583B1FA8498FD357621`.
+
+### Measurement boundary
+
+This machine slows substantially during long sessions. Benchmark order was therefore fixed and each WFC
+row was interpreted beside the controls in that process. The tables below are sequential checkpoints, not
+strict final-tree ablations: retained candidates were not independently toggled off and rerun from the final
+tree. Candidate attribution comes from structural counts, phase timers, and allocation counts together with
+the checkpoint series. Instrumented profile wall times are excluded because per-union counters intentionally
+made those runs much slower.
+
+The current-surface timings with established precedent are the portable binary-relation 4x4 Sudoku with
+eight givens through General and Optimized, and the General two-assert/two-retract live-edit cycle. The
+Friendly, sparse, and generic-representation Sudokus and the scalar, interval, affine, barometer, provenance,
+observer, and guard fixtures were correctness gates, not individually timed rows. Older Part-1 and
+mutable-core Sudoku tables belong to separate unchanged historical implementations and were not rerun.
+
+### Current finite timing continuity
+
+All values are best / mean microseconds per run. Each process timed General Sudoku, Optimized identical
+Sudoku, then General live edit.
+
+| checkpoint | General Sudoku | Optimized Sudoku | General live edit | General/Optimized best ratio |
+|---|---:|---:|---:|---:|
+| immediate pre-session record | 32,651.1 / 36,149.4 | 1,001.6 / 2,506.6 | 27.9 / 38.4 | 32.60x |
+| Phase 0 baseline | 33,726.2 / 39,027.3 | 1,369.2 / 2,439.1 | 36.5 / 48.6 | 24.63x |
+| after universal-direction elision | 38,038.4 / 41,318.1 | 737.8 / 2,390.5 | 36.6 / 50.3 | 51.56x |
+| after settled-baseline restoration | 33,107.4 / 43,872.4 | 717.4 / 2,150.7 | 38.3 / 44.5 | 46.15x |
+| after scalar binary arcs | 44,864.3 / 52,817.8 | 1,036.3 / 1,941.4 | 29.5 / 43.4 | 43.29x |
+| final, profiler removed | 31,483.6 / 195,034.4 | 619.8 / 1,491.8 | 32.1 / 43.8 | 50.80x |
+
+Against the immediate pre-session record, final General Sudoku best improved 3.6%, Optimized Sudoku best
+improved 38.1% (mean improved 40.5%), and the same-process best ratio rose 32.60x -> 50.80x. General live
+edit was 15.1% slower by best and 14.1% slower by mean than that earlier record, but faster than this
+session's Phase 0 row; it remains within the machine's observed spread. The final General mean contains a
+large late-run outlier and is not treated as a regression signal because General's implementation did not
+change and its best remained stable. No individual timing precedent exists for the other correctness-only
+examples, so no claim is made for their isolated runtimes.
+
+### Cyclic WFC ladder
+
+Each row includes lowering, generation, immutable `Map` materialization, and an independent adjacency walk
+outside timing. Values are milliseconds.
+
+| grid | Phase 0 | after universal elision | after baseline cache | after scalar arcs | final late run |
+|---|---:|---:|---:|---:|---:|
+| 16x16 | 6.843 | 3.961 | 8.954 | 3.923 | 4.956 |
+| 32x32 | 16.780 | 20.616 | 21.445 | 12.298 | 19.058 |
+| 64x64 | 100.483 | 114.013 | 101.481 | 76.795 | 86.408 |
+| 128x128 | 275.312 | 2,789.524 | 1,026.795 | 212.869 | 494.593 |
+| 500x500 | 12,011.427 | 12,463.005 | 8,099.838 | 3,842.648 | 12,087.915 |
+
+The 128x128 and final 500x500 spikes demonstrate why isolated cross-process absolutes were not used to
+accept or reject a candidate. The scalar-arc checkpoint improved every ladder row relative to Phase 0; the
+late final process then slowed all large WFC controls together despite removing the profiler and retaining
+the same outputs. There is no historical cyclic workload, so none of these rows is compared to historical
+gravity, 3-color, or ramp under another name.
+
+### Matching 500x500 WFC timing
+
+Values are best / mean milliseconds. The usual runs used two trials; gravity used two iterations per trial
+and 3-color one. Candidate 0's fingerprint check used one trial and is listed separately.
+
+| checkpoint | gravity | 3-color | evidence |
+|---|---:|---:|---|
+| Phase 0 baseline | 4,544.909 / 4,929.444 | 6,203.318 / 6,526.135 | 2 tables, 998,000 arcs; exact hashes |
+| Candidate 0 one-trial check | 4,704.256 / 4,704.256 | 5,427.033 / 5,427.033 | lookup-only change; exact hashes |
+| after universal-direction elision | 4,078.417 / 5,093.959 | 7,878.721 / 8,062.427 | gravity 1 table, 499,000 arcs; exact draw/restart sequence |
+| after settled-baseline restoration | 4,078.752 / 4,141.916 | 6,044.318 / 7,898.973 | repeat rebuild removed |
+| after scalar binary arcs | 1,057.193 / 1,196.598 | 1,228.796 / 1,311.783 | zero one-word arc arrays |
+| final, profiler removed | 3,569.262 / 4,445.822 | 3,941.998 / 4,584.026 | exact hashes; late-session drift |
+
+The applicable historical and pre-session values are embedded here so the comparison does not depend on
+earlier sections. Ratios use best times and the completed historical rerun from this session.
+
+| workload | prior recorded historical | completed historical rerun | immediate pre-session Friendly | Phase 0 | strongest retained checkpoint | final late Friendly | direct reading |
+|---|---:|---:|---:|---:|---:|---:|---|
+| gravity 500x500 | 363.597 ms | 292.197 ms | 5,959.679 ms | 4,544.909 ms | 1,057.193 ms | 3,569.262 ms | Historical rerun is 3.62x faster than the strongest Friendly checkpoint and 12.21x faster than the final late sample. Friendly nevertheless improved 5.64x at the strongest checkpoint and 1.67x in the final late sample versus its immediate pre-session record. |
+| 3-color 500x500 | 54,743.329 ms | 55,390.970 ms | 4,958.214 ms | 6,203.318 ms | 1,228.796 ms | 3,941.998 ms | Friendly is 45.08x faster than the historical rerun at the strongest checkpoint and 14.05x faster in the final late sample. It improved 4.03x at the strongest checkpoint and 1.26x in the final late sample versus its immediate pre-session record. |
+
+The workload reversal therefore remains explicit: the specialized historical implementation is still much
+faster on gravity, while the generalized Friendly implementation is much faster on 3-color. The strongest
+checkpoint shows the mechanical optimization's attainable result; the final late sample shows the machine's
+sustained-run degradation. Neither is silently substituted for the other.
+
+### Candidate evidence and decision
+
+| candidate | direct before/after evidence | outcome |
+|---|---|---|
+| Constant-time cell lookup | Linear `Seq.tryFindIndex` removed; 100,000-cell aggregate read sweep completed in 101.539 ms. Generation fingerprints unchanged. | Retained. |
+| WFC-local universal direction | Gravity tables 2 -> 1; arcs and watches 998,000 -> 499,000; explicit and elided complete maps equal; draws 1,029 -> 1,029; restarts 0 -> 0. | Retained. |
+| Settled baseline | Comparable repeat-gravity reset 266.907 -> 21.648 ms initially and 29.172 ms at the combined checkpoint; reset allocation -> 0; 499,000 reset arcs removed. Fresh-twin assertion, retraction, replacement, observer, and failed-restart tests passed. | Retained. |
+| Scalar one-word arc path | Repeat-gravity `fireArc` arrays 998,000 after elision (1,996,000 in original Phase 0 repeat) -> 0. Multiword 65/128/130 and asymmetric/full-row/empty-source behavior unchanged. | Retained. |
+| Picker replacement | Gravity initialization about 15 ms, only 4,711 stale dequeues, and 1,029 guesses. No candidate was implemented; bulk/custom heap complexity lacked evidence. | Skipped. |
+| Direct singleton extraction | Gravity extraction 260.486 -> 57.601 ms; measured output allocation about 298.5 -> 270.5 MB; immutable `Map` unchanged. | Retained. |
+| Arc/watch layout | Propagation no longer dominated after scalar arcs; immutable `Map` construction was the principal residual. | Skipped. |
+
+### Failures and completed historical run
+
+Two additions initially failed to compile: the baseline-refresh test needed an explicit Friendly network type,
+and the full-row helper needed an explicit `uint64[]` parameter. Both were type-inference corrections; after
+the annotations, the relevant correctness suites passed. No retained candidate produced a fingerprint,
+support, observer, restart, multiword, or adjacency mismatch.
+
+The first final historical process reached the five-minute command timeout after 301.9 seconds. It had passed
+correctness and printed propagation/retraction timing but had not reached generation, so it was treated as an
+incomplete run. The rerun used a larger timeout and completed in 444.6 seconds:
+
+| preserved historical row | best | mean where reported |
+|---|---:|---:|
+| reset-only W=8 | 9.780 ms | 9.780 ms |
+| ramp512 corner | 5,722.003 ms | 5,722.003 ms |
+| ramp128 center | 137.628 ms | 137.628 ms |
+| reset-only W=1 | 2.463 ms | 2.463 ms |
+| gravity column | 2.635 ms | 2.635 ms |
+| gravity-small cone retract | 1.961 ms | 2.573 ms |
+| gravity-small full replay | 1.334 ms | 1.689 ms |
+| ramp512-large cone retract | 7,658.648 ms | 8,900.784 ms |
+| ramp512-large full replay | 5,393.498 ms | 5,554.622 ms |
+| gravity generation 500x500 | 292.197 ms | 292.197 ms |
+| 3-color generation 500x500 | 55,390.970 ms | 55,390.970 ms |
+| ramp32 generation 64x64 | 161.740 ms | 161.740 ms |
+
+Against the adjacent final Friendly observation, the specialized historical route remained 12.21x faster
+on gravity while Friendly remained 14.05x faster on 3-color. These remain separate-process observations with
+different result, RNG, and search-policy contracts. Historical correctness passed, its SHA-256 remained
+exact, and its git diff was empty. Ramp appears only in this preserved table because no equivalent ramp
+workload was timed through the changed Friendly/optimized core; generic multiword correctness is not presented
+as a like-for-like ramp performance comparison.
+
+### Final decision
+
+Retain the lookup dictionary, WFC-local universal-direction check, one-engine settled candidate/support
+snapshot, scalar one-word arc path, full-row flags, and direct singleton extraction. Leave the picker and
+layout candidates unimplemented. Stop at the immutable `Map` boundary rather than introducing WFC machinery,
+a second finite engine, or a new result type. Remove all temporary profiling code, then keep both exact
+fingerprints and the complete current/historical correctness suites as the continuing regression locks.
+
+## 2026-07-11 addendum - ramp workloads through Friendly/Optimized
+
+- **Source and boundary:** `propagator-wfc-app.fsx --benchmark-ramp`. The app-local `Grid<'tile>` authors
+  integer ramp tiles through the unchanged Friendly operations. Network construction and relation-table
+  compilation are outside every stopwatch. Propagation rows reassert the same named premise, which invokes
+  the optimized rebuild path and measures restore + assert + propagation. Retraction setup is also outside
+  the stopwatch. Generation includes the public immutable `Map`, as do the existing Friendly WFC rows.
+- **Correctness gate:** the ordinary app run now checks the historical 1x100 single-pin domains, the 64-bit
+  seam, two-ended forced chain, OR-on-narrow premise support, assert-site bottom, and retract equality with a
+  freshly authored surviving-premise twin. The large harness checks the exact historical 500x500 corner and
+  center counts, retraction against a fresh twin, and every edge of the generated 64x64 ramp32 map. Ramp32's
+  stable Friendly fingerprint is
+  `3AD38489B2BB9D6165F761FAF7881C838EF338286F031B60C6419A6555C2FDAD`.
+- **Interpretation:** the rows below are sequential one-trial checkpoints on the variable Power saver
+  machine, not independent final-tree ablations. The structural-baseline result is large enough to survive
+  that limitation; scratch and set-bit attribution relies primarily on the removed operation/allocation
+  shape and the full semantic suite.
+
+| current-core checkpoint | ramp512 corner | ramp128 center | ramp512 retract | ramp32 generation |
+|---|---:|---:|---:|---:|
+| initial like-for-like harness | 19,614.021 ms | 2,563.402 ms | 23,636.274 ms | 186.608 ms |
+| invocation-local multiword scratch | 17,427.153 ms | 2,898.273 ms | 22,929.159 ms | 238.842 ms |
+| plus set-bit source iteration | 19,794.289 ms | 1,738.741 ms | 24,938.788 ms | 407.618 ms |
+| plus structural-fixpoint rebuild baseline | 6,256.278 ms | 156.072 ms | 6,010.373 ms | 332.095 ms |
+| final fixed-order control process | 6,469.697 ms | 182.009 ms | 6,822.673 ms | 305.038 ms |
+
+The initial diagnosis found two separate costs. Multiword `fireArc` allocated one `uint64[]` per firing and
+tested every authored value even when few bits remained. Invocation-local scratch removes those arrays while
+remaining safe under nested synchronous observer propagation; word-wise set-bit iteration removes absent
+value probes. More importantly, every assertion replacement and retraction rebuilt from top and enqueued all
+998,000 relation arcs. Ramp128 therefore traversed the whole 500x500 graph for a radius-127 wave. The retained
+rebuild now restores the already-computed, immutable structural fixpoint and lets authored assertions enqueue
+only cells they actually narrow. Arbitrary relations that prune top remain correct because that initial
+constraint-only fixpoint, rather than raw top, is what is restored.
+
+The directly comparable historical values are repeated here. Ratios use the final fixed-order current row
+and the completed historical rerun recorded immediately above.
+
+| workload | historical rerun | final Friendly/Optimized | direct comparison |
+|---|---:|---:|---|
+| ramp512 corner 500x500 | 5,722.003 ms | 6,469.697 ms | Friendly is 1.13x slower. |
+| ramp128 center 500x500 | 137.628 ms | 182.009 ms | Friendly is 1.32x slower. |
+| ramp512 opposite-corner retract | 7,658.648 ms cone / 5,393.498 ms replay | 6,822.673 ms | Friendly is 1.12x faster than historical cone-local and 1.27x slower than historical replay; current Optimized retraction is structural-baseline replay, not cone-local machinery. |
+| ramp32 generation 64x64 | 161.740 ms | 305.038 ms | Friendly is 1.89x slower; result materialization and seeded search contracts still differ. |
+
+The same final process ran all current WFC controls before ramp. Cyclic 16/32/64/128/500 measured
+4.456/14.578/59.317/254.079/4,167.414 ms. Matching gravity measured 1,338.347 ms and 3-color 1,324.329 ms,
+with exact fingerprints `632233C0779601913FB945173CCFDD1861FA5769185DD4114BE0FA4056D7A8B2` and
+`7A20D499A9E3BFC64249653EDC76CA6F7C0BE778A8F370A455910E1CBE5945FF`. The adjacent finite control process
+measured General Sudoku 38,748.9 / 41,028.5 us, Optimized Sudoku 994.7 / 1,028.7 us, and General live edit
+31.9 / 37.0 us, preserving a 38.95x same-run Sudoku ratio. These controls put the final ramp rows near the
+strongest earlier WFC checkpoint rather than the late 12-second drift sample.

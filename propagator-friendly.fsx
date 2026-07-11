@@ -181,6 +181,22 @@ module Domain =
               restriction = LatticeValue
               payload = function Empty -> None | interval -> Some interval }
 
+    let fixedPoint (quantum: decimal) : Network<Interval, FixedPoint, FixedPoint> =
+        FixedPoint(0m, quantum) |> ignore
+        let wrap interval = FixedPoint.FromInterval(interval, quantum)
+        let project = function Empty -> None | interval -> Some (wrap interval)
+        let inject (value: FixedPoint) = value.Interval
+        let domain =
+            ``Propagator-surface-vocab``.Domain.lattice
+                Interval.entire Interval.meet (function Empty -> true | _ -> false)
+        let core = General.createLattice domain
+        Network
+            { operations = generalOperations core project inject
+              read = function LatticeValue value -> wrap value | _ -> invalidOp "fixed-point state mismatch"
+              assertion = inject >> LatticeValue
+              restriction = inject >> LatticeValue
+              payload = project }
+
     let finite (values: 'value list) : Network<'value, 'value, Set<'value>> when 'value : comparison =
         let core = Optimized.createFinite values
         Network
