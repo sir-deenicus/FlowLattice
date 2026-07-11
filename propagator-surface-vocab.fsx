@@ -17,10 +17,9 @@
                 Scoped: PORTABLE constructs are authored once, not all constructs are portable.
 
     THE WRITE-ONCE HEART (fork C made real). A portable finite `RelationBox` carries one
-    membership predicate `allows : 'a list -> bool`. Both lowerings interpret it through the SAME
-    generalized-arc-consistency pass (`Gac.narrow`, below) — authored once, plugged into two reps
-    (a caller-supplied `FiniteRep` on General, a `uint64` word on Optimized). Identical narrowing => identical fixpoint =>
-    identical solution; that agreement is exactly what `Differential.solveBoth` asserts.
+    membership predicate over one or many equal-arity scopes. General expands scopes through
+    `Gac.narrow`; Optimized compiles grouped binary predicates once into directional support rows
+    and retains `Gac.narrow` for arbitrary n-ary scopes. Both preserve the same authored semantics.
 
     solveBoth is TEST HARNESS code, not the shipped surface (docs §7.8, Deen 2026-07-06), and is
     therefore defined only in the separate test script.
@@ -33,14 +32,9 @@
       This file is deliberately load-safe: friendly syntax and tests consume this single engine and
       vocabulary definition through `#load`.
 
-    Still stubbed (the streaming seams): `solutions` / `generate` / `onCell` / `onNet`. General
-    cell reads, support inspection, assumptions, and retraction retain one live closure engine;
-    optimized observation/edit remains part of the deferred slice (docs §9, §12).
-
-    Guardrail fix (Codex review, 2026-07-06): lowerings now reject every unsupported construct/domain
-    combination as an `UnsupportedConstruct` value instead of silently ignoring it, and the optimized
-    proof backend refuses >64-value domains or premise/search-depth requirements that exceed its one-word
-    support representation. Negative harness rows lock those failures in.
+    `generate`, snapshot observation, live finite edits, and retraction are implemented on both faces.
+    `solutions` remains deliberately deferred. Optimized finite domains use one runtime-width, cell-major
+    bitset store; the independent 64-premise support ceiling is checked at solve/edit boundaries.
 
     Review-gate fix (Codex, 2026-07-10): both DDB drivers reuse failed guess premises in LIFO order, making
     the lower-time `givens + cells` premise bound true at runtime. A sparse-givens differential slice now
@@ -51,6 +45,7 @@
 
 
 open System.Collections.Generic
+open System.Numerics
 
 
 // ---- Nouns ---------------------------------------------------------------
@@ -106,11 +101,10 @@ let scalarMeet left right =
 
 // ---- Spine (constraint boxes) -------------------------------------------
 
-/// A portable finite relation: a membership predicate over a tuple of cell values.
-/// Both faces compile it through the shared `Gac.narrow` (general filters a Set, optimized
-/// filters a word) — this is the write-once construct.
+/// A portable finite relation: one membership predicate over one or more equal-arity scopes.
 type RelationBox<'a> =
-    { cells: Cell<'a> list
+    { arity: int
+      scopes: Cell<'a> array
       allows: 'a list -> bool }
 
 /// A general-only rich dataflow relation (convert / sum / equal over lattices). `cells` are reads,
@@ -147,7 +141,6 @@ type UnsupportedConstruct =
     | DataflowOnOptimized
     | RelationRequiresFiniteDomain
     | DataflowRequiresRichLattice
-    | FiniteDomainTooWideForOptimized of needed: int * width: int
     | PremiseWidthExceeded of needed: int * width: int   // fork B overflow rides this same channel
 
 
@@ -162,6 +155,9 @@ type CellState<'a> =
     | FiniteCandidates of 'a list
     | LatticeValue of 'a
 
+type GenerationFailure =
+    | RestartLimitExceeded of attempts: int
+
 /// A lowered GENERAL network. Its private closures retain one live closure engine so reads, edits,
 /// retraction, and search all operate on the same propagated state without rebuilding a Model.
 type GeneralNet<'a> =
@@ -174,21 +170,30 @@ type GeneralNet<'a> =
           retractPremise: Premise -> unit
           readState: Cell<'a> -> CellState<'a>
           readSupport: Cell<'a> -> Set<Premise>
-          run: unit -> Solution<'a> option }
+          run: unit -> Solution<'a> option
+          generate: uint64 -> int -> Result<Solution<'a>, GenerationFailure>
+          observeCell: Cell<'a> -> (Cell<'a> * CellState<'a> -> unit) -> System.IDisposable
+          observeNet: (Cell<'a> * CellState<'a> -> unit) -> System.IDisposable }
 
-/// A lowered OPTIMIZED network (≈ the array core dressed): flat-word rep, array-backed store.
-/// Same verb, different machinery (D2). `run` captures the built array-core engine.
-type OptimizedNet<'a> = { model: Model<'a>; run: unit -> Solution<'a> option }
+/// A lowered optimized finite network. Its private closures retain one live runtime-width store.
+type OptimizedNet<'a> =
+    private
+        { addCell: string -> Cell<'a>
+          addConstraint: Constraint<'a> -> unit
+          freshPremise: unit -> Premise
+          assertState: Premise -> Cell<'a> -> CellState<'a> -> unit
+          retractPremise: Premise -> unit
+          readState: Cell<'a> -> CellState<'a>
+          readSupport: Cell<'a> -> Set<Premise>
+          run: unit -> Solution<'a> option
+          generate: uint64 -> int -> Result<Solution<'a>, GenerationFailure>
+          observeCell: Cell<'a> -> (Cell<'a> * CellState<'a> -> unit) -> System.IDisposable
+          observeNet: (Cell<'a> * CellState<'a> -> unit) -> System.IDisposable }
 
 /// A change event on a cell — the unit of the observation seam. A DU, not a bare before->after,
 /// because DDB and the trail WIDEN on backtrack and interactive edit wants restores. The payload is
 /// the rep-agnostic domain projection (remaining candidates as `'a list`), not the resolved singleton
 /// `'a` and not the backend rep; the exact projection type is the one open payload detail (§12).
-type CellChange<'a> =
-    | Narrowed of cell: Cell<'a> * before: 'a list * after: 'a list
-    | Restored of cell: Cell<'a> * before: 'a list * after: 'a list
-    | Resolved of cell: Cell<'a> * value: 'a
-    | Contradiction of cell: Cell<'a>
 
 
 // ---- Authoring (companion modules for the vocabulary nouns) -------------
@@ -235,9 +240,26 @@ module Cell =
 
 module Constraint =
 
+    let private relationBox (scopes: Cell<'a> list list) (allows: 'a list -> bool) =
+        match scopes with
+        | [] -> invalidArg "scopes" "a relation requires at least one scope"
+        | first :: _ when List.isEmpty first -> invalidArg "scopes" "relation scopes cannot be empty"
+        | first :: rest ->
+            let arity = List.length first
+            if rest |> List.exists (fun scope -> List.length scope <> arity) then
+                invalidArg "scopes" "all relation scopes must have the same arity"
+            Relation
+                { arity = arity
+                  scopes = scopes |> List.collect id |> List.toArray
+                  allows = allows }
+
     /// A portable finite relation over cells (membership predicate).
     let relation (cells: Cell<'a> list) (allows: 'a list -> bool) : Constraint<'a> =
-        Relation { cells = cells; allows = allows }
+        relationBox [ cells ] allows
+
+    /// One portable finite relation applied to many equal-arity scopes.
+    let relations (scopes: seq<Cell<'a> list>) (allows: 'a list -> bool) : Constraint<'a> =
+        relationBox (Seq.toList scopes) allows
 
     /// A general-only rich dataflow relation.
     let dataflow (cells: Cell<'a> list) (narrow: 'a list -> 'a list) : Constraint<'a> =
@@ -367,7 +389,7 @@ module Transform =
 module private Closure =
 
     type Premise = int
-    type Origin = Ext of Premise | Prop of int
+    type Origin = Ext of Premise | Prop of int | Generated of int
     type Contribution<'a> = { value: 'a; support: Set<Premise> }
 
     type Cell<'a> =
@@ -384,6 +406,7 @@ module private Closure =
     type Propagator<'a> =
         { pid: int
           reads: Cell<'a> list
+          mutable initialized: bool
           fire: unit -> (Cell<'a> * Contribution<'a>) list }
 
     type Engine<'a>(L: Lattice<'a>) =
@@ -391,14 +414,19 @@ module private Closure =
         let watch = Dictionary<int, ResizeArray<Propagator<'a>>>()
         let mutable nCell = 0
         let mutable nProp = 0
+        let handlers = Dictionary<int, int * 'a -> unit>()
+        let mutable nHandler = 0
 
         member private _.Recompute (c: Cell<'a>) =
+            let before = c.value
             let mutable v = L.top
             let mutable s = Set.empty
             for kv in c.contribs do
                 v <- L.meet v kv.Value.value
                 if not (L.equals kv.Value.value L.top) then s <- Set.union s kv.Value.support
             c.value <- v; c.support <- s
+            if not (L.equals before v) then
+                for handler in handlers.Values do handler (c.id, v)
 
         member private this.Quiesce (frontier: seq<Cell<'a>>) =
             let q = Queue<Propagator<'a>>()
@@ -406,6 +434,7 @@ module private Closure =
             Seq.iter wake frontier
             while q.Count > 0 do
                 let p = q.Dequeue()
+                p.initialized <- true
                 for (target, fact) in p.fire () do
                     let before = target.value
                     target.contribs.[Prop p.pid] <- fact
@@ -417,10 +446,49 @@ module private Closure =
             nCell <- nCell + 1; watch.[c.id] <- ResizeArray(); cells.Add c; c
 
         member _.AddProp (reads, fire) =
-            let p = { pid = nProp; reads = reads; fire = fire }
+            let p = { pid = nProp; reads = reads; initialized = false; fire = fire }
             nProp <- nProp + 1
             for c in reads do watch.[c.id].Add p
             p
+
+        member this.Stabilize () =
+            let q = Queue<Propagator<'a>>()
+            for propagators in watch.Values do
+                for propagator in propagators do
+                    if not propagator.initialized then
+                        propagator.initialized <- true
+                        q.Enqueue propagator
+            while q.Count > 0 do
+                let propagator = q.Dequeue()
+                for target, fact in propagator.fire () do
+                    let before = target.value
+                    target.contribs.[Prop propagator.pid] <- fact
+                    this.Recompute target
+                    if not (L.equals target.value before) then
+                        for next in watch.[target.id] do q.Enqueue next
+
+        member this.Collapse (c: Cell<'a>, value: 'a) =
+            c.contribs.[Generated c.id] <- { value = value; support = Set.empty }
+            this.Recompute c
+            this.Quiesce [ c ]
+
+        member this.ResetGenerated () =
+            for c in cells do
+                let dead =
+                    [ for kv in c.contribs do
+                          match kv.Key with
+                          | Prop _ | Generated _ -> yield kv.Key
+                          | Ext _ -> () ]
+                for key in dead do c.contribs.Remove key |> ignore
+                this.Recompute c
+            this.Quiesce cells
+
+        member _.Subscribe (handler: int * 'a -> unit) =
+            let id = nHandler
+            nHandler <- nHandler + 1
+            handlers.[id] <- handler
+            { new System.IDisposable with
+                member _.Dispose () = handlers.Remove id |> ignore }
 
         member _.Value (c: Cell<'a>) = c.value
 
@@ -438,107 +506,6 @@ module private Closure =
                     this.Recompute c
                     touched.Add c
             this.Quiesce touched
-
-/// The OPTIMIZED backend: `module M`'s array-backed engine from propagator-mutable-core.fsx,
-/// with two integration deltas: premise ids are range-checked, and `Seal` exposes the existing one-time
-/// freeze so zero-given models can finish setup before search reads the arrays. Structure-of-arrays,
-/// uint64 premise bitmask, one reused emit callback.
-module private ArrayCore =
-
-    type Lattice<'a> =
-        { top: 'a
-          meet: 'a -> 'a -> 'a
-          isBot: 'a -> bool
-          equals: 'a -> 'a -> bool }
-
-    type Emit<'a> = int -> 'a -> uint64 -> unit
-
-    type Engine<'a>(L: Lattice<'a>) =
-        let watchB = ResizeArray<ResizeArray<int>>()
-        let firesB = ResizeArray<Emit<'a> -> unit>()
-        let exts   = Dictionary<struct(int * int), 'a>()
-        let mutable nCell = 0
-        let mutable nProp = 0
-        let mutable values   : 'a[]     = [||]
-        let mutable supports : uint64[] = [||]
-        let mutable watch    : int[][]  = [||]
-        let mutable fires    : (Emit<'a> -> unit)[] = [||]
-        let mutable queued   : bool[]   = [||]
-        let mutable frozen   = false
-        let q = Queue<int>()
-
-        let emit (t: int) (v: 'a) (s: uint64) =
-            let nv = L.meet values.[t] v
-            if not (L.equals nv values.[t]) then
-                values.[t]   <- nv
-                supports.[t] <- supports.[t] ||| s
-                let ws = watch.[t]
-                for i in 0 .. ws.Length - 1 do
-                    let p = ws.[i]
-                    if not queued.[p] then queued.[p] <- true; q.Enqueue p
-
-        let quiesce () =
-            while q.Count > 0 do
-                let p = q.Dequeue()
-                queued.[p] <- false
-                fires.[p] emit
-
-        member private _.Freeze () =
-            if not frozen then
-                frozen   <- true
-                values   <- Array.create nCell L.top
-                supports <- Array.zeroCreate nCell
-                watch    <- [| for w in watchB -> w.ToArray() |]
-                fires    <- firesB.ToArray()
-                queued   <- Array.zeroCreate nProp
-
-        member _.NewCell () =
-            let id = nCell
-            nCell <- nCell + 1
-            watchB.Add(ResizeArray())
-            id
-
-        member _.AddProp (reads: int list, fire: Emit<'a> -> unit) =
-            let pid = nProp
-            nProp <- nProp + 1
-            firesB.Add fire
-            for c in reads do watchB.[c].Add pid
-            pid
-
-        member this.Seal () = this.Freeze ()
-
-        member _.Value   (c: int) = values.[c]
-        member _.Support (c: int) = supports.[c]
-        member _.IsBot   (c: int) = L.isBot values.[c]
-
-        member this.Assert (p: int, c: int, v: 'a) =
-            if p < 0 || p > 63 then invalidArg "p" "premise bitmask caps at 64"
-            this.Freeze ()
-            exts.[struct(p, c)] <- v
-            emit c v (1UL <<< p)
-            quiesce ()
-
-        member this.Retract (p: int) =
-            if p < 0 || p > 63 then invalidArg "p" "premise bitmask caps at 64"
-            this.Freeze ()
-            let bit = 1UL <<< p
-            let dead =
-                [ for kv in exts do
-                    let struct(pr, _) = kv.Key
-                    if pr = p then yield kv.Key ]
-            for k in dead do exts.Remove k |> ignore
-            for c in 0 .. nCell - 1 do
-                if supports.[c] &&& bit <> 0UL then
-                    values.[c]   <- L.top
-                    supports.[c] <- 0UL
-            for kv in exts do
-                let struct(pr, cc) = kv.Key
-                values.[cc]   <- L.meet values.[cc] kv.Value
-                supports.[cc] <- supports.[cc] ||| (1UL <<< pr)
-            for pid in 0 .. nProp - 1 do
-                if not queued.[pid] then queued.[pid] <- true; q.Enqueue pid
-            quiesce ()
-
 
 // ---- The write-once heart: generalized arc consistency over `allows` ----
 
@@ -560,22 +527,265 @@ module private Gac =
         go 0 []
         [ for j in 0 .. n - 1 -> [ for v in cand.[j] do if supported.[j].Contains v then yield v ] ]
 
+module private StableRandom =
+
+    let next state =
+        let state' = state + 0x9E3779B97F4A7C15UL
+        let mutable value = state'
+        value <- (value ^^^ (value >>> 30)) * 0xBF58476D1CE4E5B9UL
+        value <- (value ^^^ (value >>> 27)) * 0x94D049BB133111EBUL
+        state', value ^^^ (value >>> 31)
+
+    let rec bounded bound state =
+        if bound = 0UL then invalidArg "bound" "random bound must be positive"
+        let state', value = next state
+        let threshold = (0UL - bound) % bound
+        if value >= threshold then state', int (value % bound)
+        else bounded bound state'
+
+module private FiniteCore =
+
+    type Table =
+        { forward: uint64[]
+          reverse: uint64[] }
+
+    [<Struct>]
+    type Arc =
+        { source: int
+          target: int
+          table: int
+          reverse: bool }
+
+    type Nary<'a> =
+        { cells: int[]
+          allows: 'a list -> bool }
+
+    type Engine<'a when 'a : equality>
+        (domain: 'a[], publicCells: Cell<'a>[], constraints: Constraint<'a> list) =
+
+        let domainCount = domain.Length
+        let wordCount = max 1 ((domainCount + 63) / 64)
+        let finalMask =
+            let used = domainCount % 64
+            if used = 0 then System.UInt64.MaxValue else (1UL <<< used) - 1UL
+        let top = Array.init wordCount (fun word -> if word = wordCount - 1 then finalMask else System.UInt64.MaxValue)
+        let valueIndex = Dictionary<'a, int>()
+        let cellIndex = Dictionary<int, int>()
+        do
+            domain |> Array.iteri (fun index value -> valueIndex.Add(value, index))
+            publicCells |> Array.iteri (fun index cell -> cellIndex.Add(cell.id, index))
+
+        let encode (items: 'a list) =
+            let words = Array.zeroCreate<uint64> wordCount
+            for item in items do
+                match valueIndex.TryGetValue item with
+                | true, index -> words.[index / 64] <- words.[index / 64] ||| (1UL <<< (index % 64))
+                | _ -> invalidArg "items" "candidate is not in the authored finite domain"
+            words
+
+        let tables, arcs, naries, watches =
+            let tables = ResizeArray<Table>()
+            let arcs = ResizeArray<Arc>()
+            let naries = ResizeArray<Nary<'a>>()
+            let watches = Array.init publicCells.Length (fun _ -> ResizeArray<int>())
+            let addArc source target table reverse =
+                let id = arcs.Count
+                arcs.Add { source = source; target = target; table = table; reverse = reverse }
+                watches.[source].Add id
+            for constraintBox in constraints do
+                match constraintBox with
+                | Dataflow _ -> invalidOp "optimized finite networks do not support dataflow constraints"
+                | Relation box when box.arity = 2 ->
+                    let forward = Array.zeroCreate<uint64> (domainCount * wordCount)
+                    let reverse = Array.zeroCreate<uint64> (domainCount * wordCount)
+                    for left in 0 .. domainCount - 1 do
+                        for right in 0 .. domainCount - 1 do
+                            if box.allows [ domain.[left]; domain.[right] ] then
+                                forward.[left * wordCount + right / 64] <-
+                                    forward.[left * wordCount + right / 64] ||| (1UL <<< (right % 64))
+                                reverse.[right * wordCount + left / 64] <-
+                                    reverse.[right * wordCount + left / 64] ||| (1UL <<< (left % 64))
+                    let tableId = tables.Count
+                    tables.Add { forward = forward; reverse = reverse }
+                    for offset in 0 .. box.arity .. box.scopes.Length - 1 do
+                        let left = cellIndex.[box.scopes.[offset].id]
+                        let right = cellIndex.[box.scopes.[offset + 1].id]
+                        addArc left right tableId false
+                        addArc right left tableId true
+                | Relation box ->
+                    for offset in 0 .. box.arity .. box.scopes.Length - 1 do
+                        let ids =
+                            [| for index in offset .. offset + box.arity - 1 -> cellIndex.[box.scopes.[index].id] |]
+                        let id = naries.Count
+                        naries.Add { cells = ids; allows = box.allows }
+                        let work = -(id + 1)
+                        for cell in ids do watches.[cell].Add work
+            tables.ToArray(), arcs.ToArray(), naries.ToArray(), watches |> Array.map _.ToArray()
+
+        let state = Array.zeroCreate<uint64> (publicCells.Length * wordCount)
+        let supports = Array.zeroCreate<uint64> publicCells.Length
+        let assertions = Dictionary<struct(int * int), uint64[]>()
+        let generated = Dictionary<int, uint64[]>()
+        let handlers = Dictionary<int, int -> unit>()
+        let mutable nextHandler = 0
+        let queue = Queue<int>()
+        let queuedArcs = Array.zeroCreate<bool> arcs.Length
+        let queuedNaries = Array.zeroCreate<bool> naries.Length
+
+        let wordOffset cell = cell * wordCount
+        let hasValue cell value =
+            state.[wordOffset cell + value / 64] &&& (1UL <<< (value % 64)) <> 0UL
+        let notify cell = for handler in handlers.Values do handler cell
+        let enqueue work =
+            if work >= 0 then
+                if not queuedArcs.[work] then queuedArcs.[work] <- true; queue.Enqueue work
+            else
+                let id = -work - 1
+                if not queuedNaries.[id] then queuedNaries.[id] <- true; queue.Enqueue work
+        let enqueueCell cell = for work in watches.[cell] do enqueue work
+
+        let meetCell cell (mask: uint64[]) support =
+            let offset = wordOffset cell
+            let mutable changed = false
+            for word in 0 .. wordCount - 1 do
+                let narrowed = state.[offset + word] &&& mask.[word]
+                if narrowed <> state.[offset + word] then
+                    state.[offset + word] <- narrowed
+                    changed <- true
+            if changed then
+                supports.[cell] <- supports.[cell] ||| support
+                notify cell
+                enqueueCell cell
+            changed
+
+        let candidates cell =
+            [ for index in 0 .. domainCount - 1 do if hasValue cell index then yield domain.[index] ]
+
+        let fireArc id =
+            let arc = arcs.[id]
+            let table = tables.[arc.table]
+            let rows = if arc.reverse then table.reverse else table.forward
+            let allowed = Array.zeroCreate<uint64> wordCount
+            for value in 0 .. domainCount - 1 do
+                if hasValue arc.source value then
+                    let row = value * wordCount
+                    for word in 0 .. wordCount - 1 do
+                        allowed.[word] <- allowed.[word] ||| rows.[row + word]
+            meetCell arc.target allowed supports.[arc.source] |> ignore
+
+        let fireNary id =
+            let relation = naries.[id]
+            let before = relation.cells |> Array.map candidates |> Array.toList
+            let after = Gac.narrow relation.allows before
+            let support = relation.cells |> Array.fold (fun value cell -> value ||| supports.[cell]) 0UL
+            Array.iter2 (fun cell narrowed -> meetCell cell (encode narrowed) support |> ignore)
+                relation.cells (List.toArray after)
+
+        let quiesce () =
+            while queue.Count > 0 do
+                let work = queue.Dequeue()
+                if work >= 0 then
+                    queuedArcs.[work] <- false
+                    fireArc work
+                else
+                    let id = -work - 1
+                    queuedNaries.[id] <- false
+                    fireNary id
+
+        let enqueueAll () =
+            for id in 0 .. arcs.Length - 1 do enqueue id
+            for id in 0 .. naries.Length - 1 do enqueue (-id - 1)
+
+        let resetQueue () =
+            queue.Clear()
+            System.Array.Clear(queuedArcs, 0, queuedArcs.Length)
+            System.Array.Clear(queuedNaries, 0, queuedNaries.Length)
+
+        let setTop cell =
+            let offset = wordOffset cell
+            let mutable changed = false
+            for word in 0 .. wordCount - 1 do
+                if state.[offset + word] <> top.[word] then changed <- true
+                state.[offset + word] <- top.[word]
+            supports.[cell] <- 0UL
+            if changed then notify cell
+
+        let rebuild includeGenerated =
+            resetQueue ()
+            for cell in 0 .. publicCells.Length - 1 do setTop cell
+            assertions
+            |> Seq.sortBy (fun pair -> let struct(premise, cell) = pair.Key in premise, cell)
+            |> Seq.iter (fun pair ->
+                let struct(premise, cell) = pair.Key
+                meetCell cell pair.Value (1UL <<< premise) |> ignore)
+            if includeGenerated then
+                generated |> Seq.sortBy _.Key |> Seq.iter (fun pair -> meetCell pair.Key pair.Value 0UL |> ignore)
+            enqueueAll ()
+            quiesce ()
+
+        do
+            for cell in 0 .. publicCells.Length - 1 do
+                let offset = wordOffset cell
+                System.Array.Copy(top, 0, state, offset, wordCount)
+            enqueueAll ()
+            quiesce ()
+
+        member _.CellIndex (cell: Cell<'a>) =
+            match cellIndex.TryGetValue cell.id with
+            | true, index -> index
+            | _ -> invalidArg "cell" "cell does not belong to this network"
+
+        member _.Candidates cell = candidates cell
+        member _.CandidateCount cell =
+            let offset = wordOffset cell
+            let mutable count = 0
+            for word in 0 .. wordCount - 1 do count <- count + int (BitOperations.PopCount state.[offset + word])
+            count
+        member this.IsBottom cell = this.CandidateCount cell = 0
+        member this.IsSingleton cell = this.CandidateCount cell = 1
+        member _.Support cell = supports.[cell]
+
+        member _.Assert (premise: int, cell: int, items: 'a list) =
+            if premise < 0 || premise >= 64 then invalidArg "premise" "premise bitmask caps at 64"
+            let key = struct(premise, cell)
+            let replacing = assertions.ContainsKey key
+            assertions.[key] <- encode items
+            if replacing then rebuild true
+            else
+                meetCell cell assertions.[key] (1UL <<< premise) |> ignore
+                quiesce ()
+
+        member _.Retract premise =
+            if premise < 0 || premise >= 64 then invalidArg "premise" "premise bitmask caps at 64"
+            let dead =
+                [ for pair in assertions do
+                      let struct(found, _) = pair.Key
+                      if found = premise then yield pair.Key ]
+            for key in dead do assertions.Remove key |> ignore
+            rebuild true
+
+        member _.Collapse (cell, value: 'a) =
+            let mask = encode [ value ]
+            generated.[cell] <- mask
+            meetCell cell mask 0UL |> ignore
+            quiesce ()
+
+        member _.ResetGenerated () =
+            if generated.Count > 0 then
+                generated.Clear()
+                rebuild false
+
+        member _.Subscribe handler =
+            let id = nextHandler
+            nextHandler <- nextHandler + 1
+            handlers.[id] <- handler
+            { new System.IDisposable with
+                member _.Dispose () = handlers.Remove id |> ignore }
+
 
 // ---- General face -------------------------------------------------------
 
-let private optimizedDomainWidth = 64
 let private optimizedPremiseWidth = 64
-
-let private maxPremisesNeeded (model: Model<'a>) =
-    // Givens consume one premise each; DDB can consume at most one live guess per cell.
-    List.length model.givens + List.length model.cells
-
-let private optimizedWidthErrors (values: 'a list) (model: Model<'a>) =
-    [ if List.length values > optimizedDomainWidth then
-          yield FiniteDomainTooWideForOptimized(List.length values, optimizedDomainWidth)
-      let needed = maxPremisesNeeded model
-      if needed > optimizedPremiseWidth then
-          yield PremiseWidthExceeded(needed, optimizedPremiseWidth) ]
 
 module General =
 
@@ -620,14 +830,16 @@ module General =
         let addConstraint constraintBox =
             match constraintBox with
             | Relation box ->
-                let engineCells = box.cells |> List.map ecell
-                eng.AddProp(engineCells, fun () ->
-                    let candidates = engineCells |> List.map (fun cell -> rep.candidates cell.value)
-                    let narrowed = Gac.narrow box.allows candidates
-                    let support = engineCells |> List.map (fun cell -> cell.support) |> Set.unionMany
-                    List.map2 (fun (cell: Closure.Cell<'state>) values ->
-                        cell, { Closure.value = rep.ofValues values; Closure.support = support }) engineCells narrowed)
-                |> ignore
+                for offset in 0 .. box.arity .. box.scopes.Length - 1 do
+                    let engineCells =
+                        [ for index in offset .. offset + box.arity - 1 -> ecell box.scopes.[index] ]
+                    eng.AddProp(engineCells, fun () ->
+                        let candidates = engineCells |> List.map (fun cell -> rep.candidates cell.value)
+                        let narrowed = Gac.narrow box.allows candidates
+                        let support = engineCells |> List.map (fun cell -> cell.support) |> Set.unionMany
+                        List.map2 (fun (cell: Closure.Cell<'state>) values ->
+                            cell, { Closure.value = rep.ofValues values; Closure.support = support }) engineCells narrowed)
+                    |> ignore
             | Dataflow _ -> invalidOp "Dataflow constraints require a rich lattice domain"
 
         let freshPremise () =
@@ -645,8 +857,16 @@ module General =
                 eng.Assert(premise.pid, ecell cell, rep.ofValues values)
             | LatticeValue _ -> invalidArg "state" "finite networks require FiniteCandidates"
 
+        let engineCells () = cells |> Seq.map (fun cell -> cell, ecell cell) |> Seq.toList
+        let solution () =
+            engineCells ()
+            |> List.map (fun (publicCell, engineCell) ->
+                publicCell, List.head (rep.candidates engineCell.value))
+            |> Map.ofList
+
         let run () =
-            let engineCells = cells |> Seq.map (fun cell -> cell, ecell cell) |> Seq.toList
+            eng.Stabilize ()
+            let engineCells = engineCells ()
             let anyBottom () = engineCells |> List.exists (fun (_, cell) -> rep.isBottom cell.value)
             let rec search () =
                 if anyBottom () then false
@@ -668,13 +888,54 @@ module General =
                                     tryValues rest
                         tryValues (rep.candidates cell.value)
             if search () then
-                engineCells
-                |> List.map (fun (publicCell, engineCell) ->
-                    publicCell, List.head (rep.candidates engineCell.value))
-                |> Map.ofList
-                |> Some
+                Some (solution ())
             else
                 None
+
+        let generate seed attempts =
+            if attempts <= 0 then invalidArg "attempts" "generation attempts must be positive"
+            let mutable randomState = seed
+            let rec attempt number =
+                eng.ResetGenerated ()
+                let rec collapse () =
+                    let openCell =
+                        engineCells ()
+                        |> List.choose (fun (_, cell) ->
+                            let candidates = rep.candidates cell.value
+                            if List.length candidates > 1 then Some (List.length candidates, cell, candidates)
+                            else None)
+                        |> List.sortBy (fun (count, cell, _) -> count, cell.id)
+                        |> List.tryHead
+                    if engineCells () |> List.exists (fun (_, cell) -> rep.isBottom cell.value) then false
+                    else
+                        match openCell with
+                        | None -> true
+                        | Some (count, cell, candidates) ->
+                            let nextState, choice = StableRandom.bounded (uint64 count) randomState
+                            randomState <- nextState
+                            eng.Collapse(cell, rep.singleton candidates.[choice])
+                            collapse ()
+                if collapse () then Ok (solution ())
+                elif number < attempts then attempt (number + 1)
+                else
+                    eng.ResetGenerated ()
+                    Error (RestartLimitExceeded attempts)
+            attempt 1
+
+        let observeCell cell handler =
+            eng.Stabilize ()
+            let engineCell = ecell cell
+            handler (cell, FiniteCandidates (rep.candidates engineCell.value))
+            eng.Subscribe(fun (changed, state) ->
+                if changed = engineCell.id then handler (cell, FiniteCandidates (rep.candidates state)))
+
+        let observeNet handler =
+            eng.Stabilize ()
+            for cell, engineCell in engineCells () do
+                handler (cell, FiniteCandidates (rep.candidates engineCell.value))
+            let byId = engineCells () |> Seq.map (fun (cell, engineCell) -> engineCell.id, cell) |> dict
+            eng.Subscribe(fun (changed, state) ->
+                handler (byId.[changed], FiniteCandidates (rep.candidates state)))
 
         model.cells |> List.iter addExisting
         model.constraints |> List.iter addConstraint
@@ -689,9 +950,12 @@ module General =
           freshPremise = freshPremise
           assertState = assertState
           retractPremise = fun premise -> eng.Retract premise.pid
-          readState = fun cell -> FiniteCandidates (rep.candidates (ecell cell).value)
-          readSupport = fun cell -> publicSupport (ecell cell).support
-          run = run }
+          readState = fun cell -> eng.Stabilize (); FiniteCandidates (rep.candidates (ecell cell).value)
+          readSupport = fun cell -> eng.Stabilize (); publicSupport (ecell cell).support
+          run = run
+          generate = generate
+          observeCell = observeCell
+          observeNet = observeNet }
 
     let private latticeNet (ops: LatticeOps<'a>) (model: Model<'a>) : GeneralNet<'a> =
         let lattice : Closure.Lattice<'a> =
@@ -748,9 +1012,24 @@ module General =
             | FiniteCandidates _ -> invalidArg "state" "rich lattice networks require LatticeValue"
 
         let run () =
+            eng.Stabilize ()
             let settled = cells |> Seq.map (fun cell -> cell, (ecell cell).value) |> Seq.toList
             if settled |> List.exists (fun (_, value) -> ops.isBottom value) then None
             else Some (Map.ofList settled)
+
+        let observeCell cell handler =
+            eng.Stabilize ()
+            let engineCell = ecell cell
+            handler (cell, LatticeValue engineCell.value)
+            eng.Subscribe(fun (changed, state) ->
+                if changed = engineCell.id then handler (cell, LatticeValue state))
+
+        let observeNet handler =
+            eng.Stabilize ()
+            let engineCells = cells |> Seq.map (fun cell -> cell, ecell cell) |> Seq.toArray
+            for cell, engineCell in engineCells do handler (cell, LatticeValue engineCell.value)
+            let byId = engineCells |> Seq.map (fun (cell, engineCell) -> engineCell.id, cell) |> dict
+            eng.Subscribe(fun (changed, state) -> handler (byId.[changed], LatticeValue state))
 
         model.cells |> List.iter addExisting
         model.constraints |> List.iter addConstraint
@@ -765,9 +1044,12 @@ module General =
           freshPremise = freshPremise
           assertState = assertState
           retractPremise = fun premise -> eng.Retract premise.pid
-          readState = fun cell -> LatticeValue (eng.Value (ecell cell))
-          readSupport = fun cell -> publicSupport (ecell cell).support
-          run = run }
+          readState = fun cell -> eng.Stabilize (); LatticeValue (eng.Value (ecell cell))
+          readSupport = fun cell -> eng.Stabilize (); publicSupport (ecell cell).support
+          run = run
+          generate = fun _ _ -> invalidOp "Generate requires a finite domain"
+          observeCell = observeCell
+          observeNet = observeNet }
 
     /// Lower with a caller-supplied finite representation. The representation state remains internal
     /// to the captured engine and does not appear in the returned net, cell state, or solution.
@@ -812,11 +1094,11 @@ module General =
     let constrain (net: GeneralNet<'a>) (constraintBox: Constraint<'a>) : unit =
         net.addConstraint constraintBox
 
-    let convert net left right payload inject forward backward =
+    let convert (net: GeneralNet<'a>) left right payload inject forward backward =
         Constraint.convert left right payload inject forward backward
         |> List.iter net.addConstraint
 
-    let combine net sources target payload inject operation =
+    let combine (net: GeneralNet<'a>) sources target payload inject operation =
         Constraint.combine sources target payload inject operation
         |> net.addConstraint
 
@@ -849,12 +1131,11 @@ module General =
 
     // ---- Observation / edit seams — the deferred observation slice, still stubbed (docs §9, §12) ----
 
-    let solutions (net: GeneralNet<'a>) : Solution<'a> seq = failwith "deferred: observation slice"
-    let generate (net: GeneralNet<'a>) : Solution<'a> seq = failwith "deferred: observation slice"
-    let onCell (net: GeneralNet<'a>) (cell: Cell<'a>) (handler: CellChange<'a> -> unit) : System.IDisposable =
-        failwith "deferred: observation slice (expose OnChange per-cell)"
-    let onNet (net: GeneralNet<'a>) (handler: CellChange<'a> -> unit) : System.IDisposable =
-        failwith "deferred: observation slice (expose OnChange net-wide)"
+    let solutions (net: GeneralNet<'a>) : Solution<'a> seq = failwith "deferred: solutions"
+    let generateWith attempts seed (net: GeneralNet<'a>) = net.generate seed attempts
+    let generate seed (net: GeneralNet<'a>) = net.generate seed 32
+    let onCell (net: GeneralNet<'a>) (cell: Cell<'a>) handler = net.observeCell cell handler
+    let onNet (net: GeneralNet<'a>) handler = net.observeNet handler
     let assume (net: GeneralNet<'a>) (cell: Cell<'a>) (value: 'a) : Premise =
         let premise = net.freshPremise ()
         assertUnder net premise cell value
@@ -867,91 +1148,246 @@ module General =
 
 module Optimized =
 
-    /// Lower to the optimized face, or NAME every blocking construct as DATA. A rich `Lattice`
-    /// domain and any `Dataflow` box surface here — so general-onlyness is visible pre-engine.
-    /// A finite model of `Relation`s lowers onto the array core through the same `Gac.narrow`.
+    let private finiteNet (values: 'a list) (model: Model<'a> when 'a : comparison) =
+        let authored = List.toArray values
+        let cells = ResizeArray<Cell<'a>>(model.cells)
+        let cellIds = HashSet<int>(model.cells |> Seq.map _.id)
+        let constraints = ResizeArray<Constraint<'a>>(model.constraints)
+        let pending = Dictionary<struct(int * int), 'a list>()
+        let mutable nextPremise = 0
+        let mutable engine: FiniteCore.Engine<'a> option = None
+        let mutable searchPremises: int list = []
+
+        let cellPosition cell =
+            cells
+            |> Seq.tryFindIndex (fun candidate -> candidate.id = cell.id)
+            |> Option.defaultWith (fun () -> invalidArg "cell" "cell does not belong to this network")
+
+        let requireAuthoring () =
+            if engine.IsSome then invalidOp "structural authoring is closed after the network is first observed or run"
+
+        let ensureEngine () =
+            match engine with
+            | Some found -> found
+            | None ->
+                let built = FiniteCore.Engine<'a>(authored, cells.ToArray(), List.ofSeq constraints)
+                pending
+                |> Seq.sortBy (fun pair -> let struct(premise, cell) = pair.Key in premise, cell)
+                |> Seq.iter (fun pair ->
+                    let struct(premise, cell) = pair.Key
+                    built.Assert(premise, cell, pair.Value))
+                pending.Clear()
+                engine <- Some built
+                built
+
+        let addCell name =
+            requireAuthoring ()
+            let cell = Cell.create name
+            cells.Add cell
+            cellIds.Add cell.id |> ignore
+            cell
+
+        let addConstraint constraintBox =
+            requireAuthoring ()
+            match constraintBox with
+            | Relation box when box.scopes |> Array.exists (fun cell -> not (cellIds.Contains cell.id)) ->
+                invalidArg "constraintBox" "relation contains a cell outside this network"
+            | Relation _ -> constraints.Add constraintBox
+            | Dataflow _ -> invalidOp "optimized finite networks do not support dataflow constraints"
+
+        let freshPremise () =
+            if nextPremise >= optimizedPremiseWidth then
+                invalidOp (sprintf "PremiseWidthExceeded(%d, %d)" (nextPremise + 1) optimizedPremiseWidth)
+            let premise = { pid = nextPremise }
+            nextPremise <- nextPremise + 1
+            premise
+
+        let assertState premise cell state =
+            if premise.pid < 0 || premise.pid >= optimizedPremiseWidth then
+                invalidArg "premise" "optimized premise ids must be between 0 and 63"
+            nextPremise <- max nextPremise (premise.pid + 1)
+            let candidates =
+                match state with
+                | FiniteCandidates candidates -> candidates
+                | LatticeValue _ -> invalidArg "state" "finite networks require FiniteCandidates"
+            let index = cellPosition cell
+            match engine with
+            | Some built -> built.Assert(premise.pid, index, candidates)
+            | None -> pending.[struct(premise.pid, index)] <- candidates
+
+        let retractPremise premise =
+            match engine with
+            | Some built -> built.Retract premise.pid
+            | None ->
+                let dead =
+                    [ for pair in pending do
+                          let struct(found, _) = pair.Key
+                          if found = premise.pid then yield pair.Key ]
+                for key in dead do pending.Remove key |> ignore
+
+        let clearSearch () =
+            match engine with
+            | Some built ->
+                for premise in searchPremises |> List.sortDescending do built.Retract premise
+            | None -> ()
+            searchPremises <- []
+
+        let solution (built: FiniteCore.Engine<'a>) =
+            cells
+            |> Seq.mapi (fun index cell -> cell, List.head (built.Candidates index))
+            |> Map.ofSeq
+
+        let anyBottom (built: FiniteCore.Engine<'a>) =
+            cells |> Seq.mapi (fun index _ -> built.IsBottom index) |> Seq.exists id
+
+        let run () =
+            clearSearch ()
+            let needed = nextPremise + cells.Count
+            if needed > optimizedPremiseWidth then
+                invalidOp (sprintf "PremiseWidthExceeded(%d, %d)" needed optimizedPremiseWidth)
+            let built = ensureEngine ()
+            built.ResetGenerated ()
+            let mutable guess = nextPremise
+            let rec search () =
+                if anyBottom built then false
+                else
+                    match cells |> Seq.mapi (fun index _ -> index) |> Seq.tryFind (built.IsSingleton >> not) with
+                    | None -> true
+                    | Some cell ->
+                        let rec tryValues = function
+                            | [] -> false
+                            | value :: rest ->
+                                let premise = guess
+                                guess <- guess + 1
+                                built.Assert(premise, cell, [ value ])
+                                if search () then
+                                    searchPremises <- premise :: searchPremises
+                                    true
+                                else
+                                    built.Retract premise
+                                    guess <- premise
+                                    tryValues rest
+                        tryValues (built.Candidates cell)
+            if search () then Some (solution built) else None
+
+        let generate seed attempts =
+            if attempts <= 0 then invalidArg "attempts" "generation attempts must be positive"
+            clearSearch ()
+            let built = ensureEngine ()
+            let mutable randomState = seed
+            let rec attempt number =
+                built.ResetGenerated ()
+                let heap = PriorityQueue<int, struct(int * int)>()
+                let counts = Array.init cells.Count built.CandidateCount
+                let mutable unresolved = counts |> Array.sumBy (fun count -> if count > 1 then 1 else 0)
+                let mutable contradictions = counts |> Array.sumBy (fun count -> if count = 0 then 1 else 0)
+                let changed cell =
+                    let before = counts.[cell]
+                    let after = built.CandidateCount cell
+                    counts.[cell] <- after
+                    if before > 1 && after <= 1 then unresolved <- unresolved - 1
+                    elif before <= 1 && after > 1 then unresolved <- unresolved + 1
+                    if before = 0 && after > 0 then contradictions <- contradictions - 1
+                    elif before > 0 && after = 0 then contradictions <- contradictions + 1
+                    if after > 1 then heap.Enqueue(cell, struct(after, cell))
+                for cell in 0 .. cells.Count - 1 do
+                    if counts.[cell] > 1 then heap.Enqueue(cell, struct(counts.[cell], cell))
+                use subscription = built.Subscribe changed
+                let rec collapse () =
+                    if contradictions > 0 then false
+                    elif unresolved = 0 then true
+                    else
+                        let cell = heap.Dequeue()
+                        let count = counts.[cell]
+                        if count <= 1 then collapse ()
+                        else
+                            let candidates = built.Candidates cell
+                            let nextState, choice = StableRandom.bounded (uint64 count) randomState
+                            randomState <- nextState
+                            built.Collapse(cell, candidates.[choice])
+                            collapse ()
+                if collapse () then Ok (solution built)
+                elif number < attempts then attempt (number + 1)
+                else
+                    built.ResetGenerated ()
+                    Error (RestartLimitExceeded attempts)
+            attempt 1
+
+        let readState cell =
+            let built = ensureEngine ()
+            FiniteCandidates (built.Candidates (cellPosition cell))
+
+        let readSupport cell =
+            let support = (ensureEngine ()).Support(cellPosition cell)
+            [ for premise in 0 .. 63 do
+                  if support &&& (1UL <<< premise) <> 0UL then yield { pid = premise } ]
+            |> Set.ofList
+
+        let observeCell cell handler =
+            let built = ensureEngine ()
+            let index = cellPosition cell
+            handler (cell, FiniteCandidates (built.Candidates index))
+            built.Subscribe(fun changed ->
+                if changed = index then handler (cell, FiniteCandidates (built.Candidates index)))
+
+        let observeNet handler =
+            let built = ensureEngine ()
+            for index in 0 .. cells.Count - 1 do
+                handler (cells.[index], FiniteCandidates (built.Candidates index))
+            built.Subscribe(fun changed ->
+                handler (cells.[changed], FiniteCandidates (built.Candidates changed)))
+
+        model.givens
+        |> List.iter (fun (cell, value) ->
+            let premise = freshPremise ()
+            assertState premise cell (FiniteCandidates [ value ]))
+
+        { addCell = addCell
+          addConstraint = addConstraint
+          freshPremise = freshPremise
+          assertState = assertState
+          retractPremise = retractPremise
+          readState = readState
+          readSupport = readSupport
+          run = run
+          generate = generate
+          observeCell = observeCell
+          observeNet = observeNet }
+
     let lower (model: Model<'a> when 'a : comparison) : Result<OptimizedNet<'a>, UnsupportedConstruct list> =
         let constraintBad =
-            [ for c in model.constraints do
-                match c with
-                | Dataflow _ -> yield DataflowOnOptimized
-                | Relation _ -> () ]
+            [ for constraintBox in model.constraints do
+                  match constraintBox with
+                  | Dataflow _ -> yield DataflowOnOptimized
+                  | Relation _ -> () ]
         match model.domain with
         | Lattice _ -> Error (RichLatticeOnOptimized :: constraintBad)
         | Finite values ->
-            let unsupported = constraintBad @ optimizedWidthErrors values model
-            if not (List.isEmpty unsupported) then Error unsupported
-            else
-                let tagged = values |> List.mapi (fun i value -> value, 1UL <<< i) |> List.toArray
-                let bitByValue : IReadOnlyDictionary<'a, uint64> =
-                    let index = Dictionary<'a, uint64>()
-                    for (value, bit) in tagged do index.Add(value, bit)
-                    index
-                let bitOf (value: 'a) = bitByValue.[value]
-                let topWord = tagged |> Array.fold (fun word (_, bit) -> word ||| bit) 0UL
-                let decode (word: uint64) =
-                    [ for (value, bit) in tagged do
-                          if word &&& bit <> 0UL then yield value ]
-                let encode (vs: 'a list) = vs |> List.fold (fun a v -> a ||| bitOf v) 0UL
-                let latticeW : ArrayCore.Lattice<uint64> =
-                    { top = topWord; meet = (&&&); isBot = (fun w -> w = 0UL); equals = (=) }
-                let s = ArrayCore.Engine<uint64>(latticeW)
-                let imap = Dictionary<int, int>()
-                for pc in model.cells do imap.[pc.id] <- s.NewCell ()
-                let icell (pc: Cell<'a>) = imap.[pc.id]
-                for c in model.constraints do
-                    match c with
-                    | Relation box ->
-                        let ids = box.cells |> List.map icell
-                        s.AddProp(ids, fun emit ->
-                            let sup = ids |> List.fold (fun a c -> a ||| s.Support c) 0UL
-                            let cand = ids |> List.map (fun c -> decode (s.Value c))
-                            let narrowed = Gac.narrow box.allows cand
-                            List.iter2 (fun c vs -> emit c (encode vs) sup) ids narrowed) |> ignore
-                    | Dataflow _ -> failwith "preflight missed unsupported optimized constraint"
-                s.Seal ()
-                model.givens |> List.iteri (fun i (pc, v) -> s.Assert(i, icell pc, encode [v]))
-                let run () =
-                    let icells = model.cells |> List.map (fun pc -> pc, icell pc)
-                    let single (w: uint64) = w <> 0UL && (w &&& (w - 1UL)) = 0UL
-                    let anyBot () = icells |> List.exists (fun (_, c) -> s.IsBot c)
-                    let mutable gp = List.length model.givens
-                    let rec go () =
-                        if anyBot () then false
-                        else
-                            match icells |> List.tryFind (fun (_, c) ->
-                                      not (s.IsBot c) && not (single (s.Value c))) with
-                            | None -> true
-                            | Some (_, c) ->
-                                let rec tryV lst =
-                                    match lst with
-                                    | [] -> false
-                                    | v :: rest ->
-                                        let p = gp in gp <- gp + 1
-                                        s.Assert(p, c, encode [v])
-                                        if go () then true
-                                        else
-                                            s.Retract p
-                                            gp <- p
-                                            tryV rest
-                                tryV (decode (s.Value c))
-                    if go () then
-                        Some (icells |> List.map (fun (pc, c) -> pc, List.head (decode (s.Value c))) |> Map.ofList)
-                    else None
-                Ok { model = model; run = run }
+            let premiseBad =
+                if List.length model.givens > optimizedPremiseWidth then
+                    [ PremiseWidthExceeded(List.length model.givens, optimizedPremiseWidth) ]
+                else []
+            let errors = constraintBad @ premiseBad
+            if List.isEmpty errors then Ok (finiteNet values model) else Error errors
 
-    /// One solution (DDB on the array core — same laws, different machinery from the general face).
-    let solve (net: OptimizedNet<'a>) : Solution<'a> option = net.run ()
+    let createFinite (values: 'a list when 'a : comparison) =
+        let domain = Domain.finite values
+        finiteNet values { domain = domain; cells = []; constraints = []; givens = [] }
 
-    // ---- Observation / edit seams — the deferred observation slice, still stubbed ----
-
-    let solutions (net: OptimizedNet<'a>) : Solution<'a> seq = failwith "deferred: observation slice"
-    let generate (net: OptimizedNet<'a>) : Solution<'a> seq = failwith "deferred: observation slice"
-    let onCell (net: OptimizedNet<'a>) (cell: Cell<'a>) (handler: CellChange<'a> -> unit) : System.IDisposable =
-        failwith "deferred: observation slice (trail OnChange per-cell)"
-    let onNet (net: OptimizedNet<'a>) (handler: CellChange<'a> -> unit) : System.IDisposable =
-        failwith "deferred: observation slice (trail OnChange net-wide)"
-    let assume (net: OptimizedNet<'a>) (cell: Cell<'a>) (value: 'a) : Premise =
-        failwith "deferred: edit slice (Assert under fresh premise)"
-    let retract (net: OptimizedNet<'a>) (premise: Premise) : unit =
-        failwith "deferred: edit slice (cone-local Retract)"
+    let cell (net: OptimizedNet<'a>) name = net.addCell name
+    let constrain (net: OptimizedNet<'a>) constraintBox = net.addConstraint constraintBox
+    let freshPremise (net: OptimizedNet<'a>) = net.freshPremise ()
+    let assertStateUnder (net: OptimizedNet<'a>) premise cell state = net.assertState premise cell state
+    let solve (net: OptimizedNet<'a>) = net.run ()
+    let value (net: OptimizedNet<'a>) cell = net.readState cell
+    let support (net: OptimizedNet<'a>) cell = net.readSupport cell
+    let solutions (net: OptimizedNet<'a>) : Solution<'a> seq = failwith "deferred: solutions"
+    let generateWith attempts seed (net: OptimizedNet<'a>) = net.generate seed attempts
+    let generate seed (net: OptimizedNet<'a>) = net.generate seed 32
+    let onCell (net: OptimizedNet<'a>) cell handler = net.observeCell cell handler
+    let onNet (net: OptimizedNet<'a>) handler = net.observeNet handler
+    let assume (net: OptimizedNet<'a>) cell value =
+        let premise = net.freshPremise ()
+        net.assertState premise cell (FiniteCandidates [ value ])
+        premise
+    let retract (net: OptimizedNet<'a>) premise = net.retractPremise premise

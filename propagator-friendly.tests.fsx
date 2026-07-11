@@ -106,9 +106,12 @@ module private Slices =
           constraints = [ Constraint.relation [ a; b ] (fun _ -> true) ]
           givens = [] }
 
-    let wideDomainGuard () : Model<int> =
+    let wideDomainGuard count : Model<int> =
         let c = Cell.create "wide-domain-cell"
-        { domain = Domain.finite [1..65]; cells = [ c ]; constraints = []; givens = [] }
+        { domain = Domain.finite [0 .. count - 1]
+          cells = [ c ]
+          constraints = [ Constraint.relation [ c ] (function [ value ] -> value = count - 1 | _ -> false) ]
+          givens = [] }
 
     let premiseWidthGuard () : Model<int> =
         let cells = List.init 65 (fun i -> (Cell.create (sprintf "pwidth-%d" i) : Cell<int>))
@@ -161,12 +164,14 @@ module private Harness =
             for constraintBox in model.constraints do
                 match constraintBox with
                 | Relation box ->
-                    let before = box.cells |> List.map (fun cell -> Map.find cell candidates)
-                    let after = TestGac.narrow box.allows before
-                    if after <> before then
-                        changed <- true
-                        for cell, narrowed in List.zip box.cells after do
-                            candidates <- Map.add cell narrowed candidates
+                    for offset in 0 .. box.arity .. box.scopes.Length - 1 do
+                        let cells = [ for index in offset .. offset + box.arity - 1 -> box.scopes.[index] ]
+                        let before = cells |> List.map (fun cell -> Map.find cell candidates)
+                        let after = TestGac.narrow box.allows before
+                        if after <> before then
+                            changed <- true
+                            for cell, narrowed in List.zip cells after do
+                                candidates <- Map.add cell narrowed candidates
                 | Dataflow _ ->
                     invalidArg "model" "initialFixpoint requires portable finite relations"
         candidates
@@ -185,10 +190,14 @@ module private Harness =
                 | Relation box -> box
                 | Dataflow _ -> invalidArg "model" "bruteForceSolutions requires portable finite relations")
         let relationAllows (assignment: Solution<'a>) (box: RelationBox<'a>) =
-            let assigned = box.cells |> List.map (fun cell -> Map.tryFind cell assignment)
-            if assigned |> List.forall Option.isSome then
-                assigned |> List.map Option.get |> box.allows
-            else true
+            [ 0 .. box.arity .. box.scopes.Length - 1 ]
+            |> List.forall (fun offset ->
+                let assigned =
+                    [ for index in offset .. offset + box.arity - 1 ->
+                          Map.tryFind box.scopes.[index] assignment ]
+                if assigned |> List.forall Option.isSome then
+                    assigned |> List.map Option.get |> box.allows
+                else true)
         let rec enumerate remaining (assignment: Solution<'a>) =
             seq {
                 match remaining with
@@ -211,12 +220,6 @@ let private gridOf (model: Model<int>) (sol: Solution<int>) =
 let private showGrid (label: string) (g: int list list) =
     printfn "  %s" label
     for row in g do printfn "     %A" row
-
-let private hasFiniteWidth needed width =
-    List.exists (function FiniteDomainTooWideForOptimized(n, w) when n = needed && w = width -> true | _ -> false)
-
-let private hasPremiseWidth needed width =
-    List.exists (function PremiseWidthExceeded(n, w) when n = needed && w = width -> true | _ -> false)
 
 let expected = [ [1;2;3;4]; [3;4;1;2]; [2;1;4;3]; [4;3;2;1] ]
 
@@ -468,11 +471,234 @@ module private FriendlyRegression =
         printfn ""
         true
 
+module private FriendlyFiniteUx =
+
+    open ``Propagator-friendly``
+
+    let run () =
+        let net = Domain.finite [ 1; 2; 3 ]
+        let a = net.Cell "a"
+        let b = net.Cell "b"
+        let c = net.Cell "c"
+        net.Relate([ a; b; c ], fun values -> List.length values = List.length (List.distinct values))
+        net.RelateMany(
+            [ [ a; b ]; [ b; c ] ],
+            function [ left; right ] -> left <> right | _ -> false)
+        net.Given(a, 1)
+        let replay = Dictionary<Cell<int>, CellState<int>>()
+        use subscription = net.Observe(fun (cell, state) -> replay.[cell] <- state)
+        let generated = net.Generate 42UL
+        let methodOk =
+            match generated with
+            | Ok solution ->
+                replay.Count = 3
+                && replay
+                   |> Seq.forall (fun pair ->
+                       match pair.Value with
+                       | FiniteCandidates [ value ] -> Map.find pair.Key solution = value
+                       | _ -> false)
+            | Error _ -> false
+
+        let opsOk =
+            network (Domain.finite [ 1; 2 ]) {
+                let! left = Ops.cell "left"
+                let! right = Ops.cell "right"
+                do! Ops.relate [ left; right ] (function [ x; y ] -> x <> y | _ -> false)
+                do! Ops.given left 1
+                let! generated = Ops.generate 7UL
+                return
+                    match generated with
+                    | Ok solution -> Map.find left solution = 1 && Map.find right solution = 2
+                    | Error _ -> false
+            }
+        methodOk && opsOk
+
+module private FiniteCoreRegression =
+
+    let private lowerGeneral model =
+        match General.lower model with
+        | Ok net -> net
+        | Error errors -> failwithf "General.lower failed: %A" errors
+
+    let private lowerOptimized model =
+        match Optimized.lower model with
+        | Ok net -> net
+        | Error errors -> failwithf "Optimized.lower failed: %A" errors
+
+    let private groupedModel arity =
+        let cells = List.init 4 (fun index -> Cell.create (sprintf "group-%d-%d" arity index))
+        let scopes =
+            if arity = 2 then [ [ cells.[0]; cells.[1] ]; [ cells.[1]; cells.[2] ]; [ cells.[2]; cells.[3] ] ]
+            else [ [ cells.[0]; cells.[1]; cells.[2] ]; [ cells.[1]; cells.[2]; cells.[3] ] ]
+        let allows values = values |> List.forall ((=) (List.head values))
+        let grouped =
+            { domain = Domain.finite [ 2; 1; 0 ]
+              cells = cells
+              constraints = [ Constraint.relations scopes allows ]
+              givens = [ cells.[0], 1 ] }
+        let expanded =
+            { grouped with constraints = scopes |> List.map (fun scope -> Constraint.relation scope allows) }
+        grouped, expanded
+
+    let groupedEquivalence () =
+        [ 2; 3 ]
+        |> List.forall (fun arity ->
+            let grouped, expanded = groupedModel arity
+            let solveGeneral model = General.solve (lowerGeneral model)
+            let solveOptimized model = Optimized.solve (lowerOptimized model)
+            let expected = Some (grouped.cells |> List.map (fun cell -> cell, 1) |> Map.ofList)
+            solveGeneral grouped = expected
+            && solveGeneral expanded = expected
+            && solveOptimized grouped = expected
+            && solveOptimized expanded = expected)
+
+    let wideDomains () =
+        [ 65; 128; 130 ]
+        |> List.forall (fun count ->
+            let model = Slices.wideDomainGuard count
+            let cell = List.head model.cells
+            match Optimized.solve (lowerOptimized model) with
+            | Some solution -> Map.find cell solution = count - 1
+            | None -> false)
+
+    let asymmetricBinary () =
+        let left = Cell.create "asymmetric-left"
+        let right = Cell.create "asymmetric-right"
+        let model =
+            { domain = Domain.finite [ 0 .. 64 ]
+              cells = [ left; right ]
+              constraints =
+                  [ Constraint.relation [ left; right ] (function
+                        | [ a; b ] -> b = (a + 1) % 65
+                        | _ -> false) ]
+              givens = [ left, 64 ] }
+        match Optimized.solve (lowerOptimized model) with
+        | Some solution -> Map.find left solution = 64 && Map.find right solution = 0
+        | None -> false
+
+    let compileOncePerGroup () =
+        let mutable calls = 0
+        let cells = List.init 5 (fun index -> Cell.create (sprintf "compile-%d" index))
+        let scopes = cells |> List.pairwise |> List.map (fun (left, right) -> [ left; right ])
+        let allows = function
+            | [ left; right ] -> calls <- calls + 1; left <> right
+            | _ -> false
+        let model =
+            { domain = Domain.finite [ 1; 2; 3 ]
+              cells = cells
+              constraints = [ Constraint.relations scopes allows ]
+              givens = [] }
+        let solved = Optimized.solve (lowerOptimized model) |> Option.isSome
+        solved && calls = 9
+
+    let generationAndReplay () =
+        let cells = List.init 6 (fun index -> Cell.create (sprintf "generate-%d" index))
+        let scopes = cells |> List.pairwise |> List.map (fun (left, right) -> [ left; right ])
+        let model =
+            { domain = Domain.finite [ 2; 0; 1 ]
+              cells = cells
+              constraints =
+                  [ Constraint.relations scopes (function [ left; right ] -> left <> right | _ -> false) ]
+              givens = [] }
+        let general = lowerGeneral model
+        let optimized = lowerOptimized model
+        let generalReplay = Dictionary<Cell<int>, CellState<int>>()
+        let optimizedReplay = Dictionary<Cell<int>, CellState<int>>()
+        use generalSubscription = General.onNet general (fun (cell, state) -> generalReplay.[cell] <- state)
+        use optimizedSubscription = Optimized.onNet optimized (fun (cell, state) -> optimizedReplay.[cell] <- state)
+        match General.generateWith 8 0x123456789ABCDEF0UL general,
+              Optimized.generateWith 8 0x123456789ABCDEF0UL optimized with
+        | Ok generalSolution, Ok optimizedSolution ->
+            let replayMatches (replay: Dictionary<Cell<int>, CellState<int>>) solution =
+                replay.Count = cells.Length
+                && replay
+                   |> Seq.forall (fun pair ->
+                       match pair.Value with
+                       | FiniteCandidates [ value ] -> Map.find pair.Key solution = value
+                       | _ -> false)
+            generalSolution = optimizedSolution
+            && replayMatches generalReplay generalSolution
+            && replayMatches optimizedReplay optimizedSolution
+        | _ -> false
+
+    let rngGolden () =
+        let cells = List.init 4 (fun index -> Cell.create (sprintf "rng-%d" index))
+        let model =
+            { domain = Domain.finite [ 0 .. 9 ]
+              cells = cells
+              constraints = []
+              givens = [] }
+        let values solution = cells |> List.map (fun cell -> Map.find cell solution)
+        match General.generateWith 1 0UL (lowerGeneral model), Optimized.generateWith 1 0UL (lowerOptimized model) with
+        | Ok general, Ok optimized -> values general = [ 5; 0; 9; 4 ] && general = optimized
+        | _ -> false
+
+    let restartFailure () =
+        let cell = Cell.create "impossible"
+        let model =
+            { domain = Domain.finite [ 1; 2 ]
+              cells = [ cell ]
+              constraints = [ Constraint.relation [ cell ] (fun _ -> false) ]
+              givens = [] }
+        General.generateWith 3 1UL (lowerGeneral model) = Error (RestartLimitExceeded 3)
+        && Optimized.generateWith 3 1UL (lowerOptimized model) = Error (RestartLimitExceeded 3)
+
+    let premiseGuard () =
+        let model = Slices.premiseWidthGuard ()
+        let net = lowerOptimized model
+        let generationOk = Optimized.generateWith 1 9UL net |> Result.isOk
+        let solveFails =
+            try
+                Optimized.solve net |> ignore
+                false
+            with :? System.InvalidOperationException as error ->
+                error.Message.Contains("PremiseWidthExceeded(65, 64)")
+        generationOk && solveFails
+
+    let liveRetractionAndDisposal () =
+        let left = Cell.create "live-left"
+        let right = Cell.create "live-right"
+        let model =
+            { domain = Domain.finite [ 1; 2 ]
+              cells = [ left; right ]
+              constraints = [ Constraint.relation [ left; right ] (function [ a; b ] -> a = b | _ -> false) ]
+              givens = [] }
+        let net = lowerOptimized model
+        let mutable events = 0
+        let subscription = Optimized.onCell net right (fun _ -> events <- events + 1)
+        let premise = Optimized.assume net left 1
+        let narrowed =
+            Optimized.value net right = FiniteCandidates [ 1 ]
+            && Optimized.support net right = Set.singleton premise
+        subscription.Dispose()
+        subscription.Dispose()
+        let beforeRetraction = events
+        Optimized.retract net premise
+        narrowed
+        && Optimized.value net right = FiniteCandidates [ 1; 2 ]
+        && Set.isEmpty (Optimized.support net right)
+        && events = beforeRetraction
+
+    let run () =
+        groupedEquivalence ()
+        && wideDomains ()
+        && asymmetricBinary ()
+        && compileOncePerGroup ()
+        && generationAndReplay ()
+        && rngGolden ()
+        && restartFailure ()
+        && premiseGuard ()
+        && liveRetractionAndDisposal ()
+
 let main () =
     printfn "runtime: %s" (System.Runtime.InteropServices.RuntimeInformation.FrameworkDescription)
     printfn ""
 
     let friendlyOk = FriendlyRegression.run ()
+    let friendlyFiniteUxOk = FriendlyFiniteUx.run ()
+    printfn "== Friendly finite UX lock =="
+    printfn "  methods and Ops cover relations, repeated scopes, generation, and replay: %b" friendlyFiniteUxOk
+    printfn ""
 
     printfn "== slice 2: 4x4 Sudoku through BOTH lowerings (Differential.solveBoth) =="
     let sud = Slices.sudoku4 ()
@@ -481,7 +707,7 @@ let main () =
         | Ok (Some fSol, Some oSol) ->
             let fg, og = gridOf sud fSol, gridOf sud oSol
             showGrid "general  (closure engine, FiniteRep.set):" fg
-            showGrid "optimized (array core, uint64 word):"  og
+            showGrid "optimized (runtime-width finite core):"  og
             let agree = fSol = oSol
             let correct = fg = expected && og = expected
             printfn "  solveBoth agree: %b   both = known solution: %b" agree correct
@@ -535,7 +761,7 @@ let main () =
         | Error es -> printfn "  FAIL: general rejected C<->F %A" es; false
     printfn ""
 
-    printfn "== generic General representation, guardrails, and one-word widths =="
+    printfn "== generic General representation, guardrails, and runtime widths =="
     let duplicateDomain =
         try
             Domain.finite [ 1; 1; 2 ] |> ignore
@@ -586,14 +812,10 @@ let main () =
         | Error es -> printfn "  General.lower lattice+relation rejects: %A" es; es = [ RelationRequiresFiniteDomain ]
         | Ok _ -> printfn "  FAIL: general silently ignored rich-domain relation"; false
 
-    let wideDomain =
-        match Optimized.lower (Slices.wideDomainGuard ()) with
-        | Error es -> printfn "  Optimized.lower 65-value domain rejects: %A" es; hasFiniteWidth 65 64 es
-        | Ok _ -> printfn "  FAIL: optimized accepted a 65-value one-word domain"; false
-    let premiseWidth =
-        match Optimized.lower (Slices.premiseWidthGuard ()) with
-        | Error es -> printfn "  Optimized.lower 65-cell DDB bound rejects: %A" es; hasPremiseWidth 65 64 es
-        | Ok _ -> printfn "  FAIL: optimized accepted a >64 premise/search-depth bound"; false
+    let wideDomain = FiniteCoreRegression.wideDomains ()
+    printfn "  Optimized propagates 65-, 128-, and 130-value domains: %b" wideDomain
+    let premiseWidth = FiniteCoreRegression.premiseGuard ()
+    printfn "  65-cell model lowers/generates; optimized solve rejects before search: %b" premiseWidth
     let guardOk =
         duplicateDomain && genericGeneral && authoredOrderPreserved && dataflowFinite && relationLattice && wideDomain && premiseWidth
     printfn ""
@@ -626,7 +848,21 @@ let main () =
     printfn "  partial contradiction remains cell-local; retract restores live state: %b" liveOk
     printfn ""
 
-    let ok = friendlyOk && sudokuOk && sparseDifferentialOk && optRejects && generalRuns && guardOk && liveOk
+    let finiteCoreOk = FiniteCoreRegression.run ()
+    printfn "== generalized finite core regressions =="
+    printfn "  grouping, multiword, asymmetric tables, generation, replay, restart, and edits: %b" finiteCoreOk
+    printfn ""
+
+    let ok =
+        friendlyOk
+        && friendlyFiniteUxOk
+        && sudokuOk
+        && sparseDifferentialOk
+        && optRejects
+        && generalRuns
+        && guardOk
+        && liveOk
+        && finiteCoreOk
     if ok && fsi.CommandLineArgs |> Array.contains "--benchmark" then
         let timedModel =
             Slices.sudoku4PairwiseWithGivens

@@ -943,6 +943,178 @@ file and dated history remain untouched. A replacement work order should be cut 
 authoring shape, high-performance backend path, smallest generic core seams, replay contract, and comparative
 benchmark plan have been agreed.
 
+**Fable (Tier 0) review + reversal, 2026-07-10 — the Codex recut review: ACCEPTED; the backend-placement
+fork resolved by diagnosis; Deen ratified.** Codex's seven findings stand. My first response to finding 2
+recommended keeping the fast machinery WFC-local; Deen challenged the recommendation ("WFC is constraint
+prop at heart — if it's not encodable, either the library overfit to a demo or WFC-specific optimizations
+are being smuggled"), and the challenge is correct. Diagnosis, recorded openly:
+
+- **The overfit is real and datable.** `optimizedDomainWidth = 64` (one `uint64` word per cell) and the
+  closure-boxed relations narrowed by tuple-enumerating `Gac.narrow` were dimensioned by the Sudoku proof
+  fixture (9 values, small slices) and survived three review cycles unquestioned. The domain-width cap rode
+  under cover of the fork-B decision, which was about *premise* width — a genuinely separate 64 (a DDB solve
+  capability), conflated with domain width by proximity.
+- **There was no smuggling — the "WFC-specific machinery" is not WFC-specific.** The historical
+  `Wfc.Engine` declares this itself ("Same laws as module M... different machinery"; selection policy is
+  driver-side; "the engine never learns what a 'guess' is"). Its inventory — multiword bitset domains
+  (`(nTiles + 63) / 64` is the generic width formula for any finite domain), binary relations precompiled to
+  per-value support masks (bit-parallel GAC), flat cell-major store, trail, premise supports — is generic
+  finite-CSP machinery throughout. My earlier framing labeled the contents by the filename; that mislabeling
+  manufactured the appearance of failure (2) to protect failure (1). The genuinely domain-shaped remainder
+  is exactly two things, both already outside the engine: the 4-neighbor grid topology (a special case of an
+  edge list) and weighted-entropy selection (driver policy; plain MRV is the generic default).
+
+Resolution, ratified by Deen 2026-07-10: **fix the core's finite story rather than route around it.** The
+historical engine's role sharpens accordingly — not machinery to preserve *from* generalization but the
+*prototype* of the generalized face. The replacement work order below supersedes the 2026-07-10 third-slice
+order (preserved verbatim above): its in-place placement and deliberately non-60fps framing die; its verb
+split, premise invariant, and RNG discipline survive as laws; its `CellChange` event taxonomy is replaced by
+the snapshot contract.
+
+**Fable (Tier 0) work order, 2026-07-10 — third slice recut: the generalized finite face, `generate` +
+snapshot observation, and the WFC application file.** Locked rules are marked; mechanism is the executor's
+discretion. Three deliverables, one pass.
+
+*Deliverable A — generalize the optimized finite face
+([propagator-surface-vocab.fsx](../propagator-surface-vocab.fsx)).*
+
+- **Locked, one store, width-parameterized:** the optimized face's cell representation becomes a multiword
+  bitset — `W = ceil(|domain| / 64)` words per cell in a flat cell-major array. The current single-word face
+  is the `W = 1` case of this store, not a sibling architecture; there are not two optimized faces at the
+  end of this slice. Domain width ceases to be a capability limit. **Premise width ≤ 64 remains** a
+  capability, honestly, and it is a *solve* capability (see the preflight relocation below).
+- **Locked, relations compile at lowering:** authoring is unchanged — `Constraint.relation` with a closure
+  `allows`. The optimized lowering compiles each *binary* relation to per-value support-mask tables by
+  sampling `allows` over dom×dom (the `allowed[d][t]` shape the prototype already proved), giving
+  bit-parallel GAC on the hot path. Zero new authoring nouns. N-ary relations keep the generic `Gac.narrow`
+  route — correct, slower, and honest about it.
+- **Locked, the no-regression canary:** generalizing must not tax `W = 1`. The existing Sudoku differential
+  rows and same-run benchmark ratios are the canary; a materially worse optimized/general ratio on the
+  existing rows fails the slice.
+- Edge representation inside the lowering (explicit edge list vs. structure-implicit enumeration), trail
+  mechanism, and table layout are executor's discretion.
+
+*Deliverable B — `generate` + observation on the vocabulary faces, under the surviving laws.*
+
+- **Locked, the verb split (law):** `solve` stays exactly as it is — complete DDB, deterministic, value
+  order = authored order (existing canaries hold). `generate` is the stochastic sampler: propagate to
+  fixpoint → pick the open cell with fewest candidates (ties by `model.cells` order) → draw from the
+  authored-order candidate list → collapse → repeat; contradiction restarts the whole sample; loud failure
+  past a bounded restart count. No interleaving with DDB.
+- **Locked, the premise invariant (law):** `generate`'s collapses consume **no premises** — never retracted
+  individually; contradiction aborts the sample; live premises during `generate` = givens only, independent
+  of grid size. Mechanism is the executor's choice; the invariant is not.
+- **Locked, RNG discipline (law):** an explicit pure PRNG in core (SplitMix64 suggested), seeded via a
+  strategy parameter — not `System.Random`. Draws are a function of visible state only (authored-order
+  candidate lists, `model.cells` order), never of rep internals. Uniform draws this slice; tile *weights*
+  are a deferred strategy extension. Acceptance theorem: **same model + same seed ⇒ identical map on every
+  route that can run it** — the differential harness extended to `generate`, General reference vs. the
+  generalized optimized face.
+- **Locked, the result shape:** one seeded map per call — `Solution option` (or a Result carrying the
+  bounded-restart exhaustion), not a lazy stream. Repeated generation is calling again with the next seed.
+- **Locked, the preflight relocation:** `PremiseWidthExceeded` moves from `Optimized.lower` to
+  `Optimized.solve` (loud, pre-search). Lowering keeps only what lowering itself needs. The existing 65-cell
+  guard row **changes** — it becomes the new law's positive test: such a model lowers and `generate`s, while
+  deterministic `solve` fails loudly before search. (This corrects the superseded order's "every row passes
+  unchanged" acceptance line, which contradicted its own relocation.)
+- **Locked, observation as snapshots:** an event is `(cell, current CellState)` — no event taxonomy, no
+  candidate-list payload. This is lattice-general for free (scalar/interval cells covered with no new
+  semantics). Subscription emits one synthetic snapshot per cell at subscribe time — the declared replay
+  baseline. **Replay law:** per-cell last-write-wins; the final event per cell *is* the final state; the
+  stream folds to the final net with no net inspection. Calling contract per §12: synchronous, engine
+  thread, mid-propagation (search observes speculative narrowing — the honest contract), `IDisposable`,
+  buffering is the outer wrapper's job.
+
+*Deliverable C — the WFC application file (**new file: [propagator-wfc-app.fsx](../propagator-wfc-app.fsx)**).*
+
+- **Locked, preservation:** the historical [propagator-wfc.fsx](../propagator-wfc.fsx) is not modified. The
+  new file consumes the vocabulary via `#load "propagator-surface-vocab.fsx"` and may `#load` the historical
+  file for the comparative benchmark. Nothing is copied out of either.
+- **Locked, the Friendly acceptance criterion:** the file exposes a domain-shaped authoring layer — tileset,
+  compatibility, grid size, seed — with zero model / lowering / representation / engine nouns visible to the
+  WFC author. If the layer cannot be thin over the enduring vocabulary, that is a Friendly failure to
+  surface and fix in the library, not to hide in the wrapper. App-level content: tiles, 4-neighbor grid
+  topology builder, rendering; one shared relation box per direction reused across edges.
+- **Locked, the oracles:** (a) post-hoc independent map walk — every adjacent pair satisfies the
+  compatibility table and every cell is resolved, no engine involved; (b) the cross-route seed test at small
+  size (e.g. 8×8): same seed, General and optimized faces, identical maps; (c) a replay check: the snapshot
+  stream folds to the final grid; (d) a contradiction-capable tileset row forcing restarts, proving the
+  bounded-restart loud failure.
+- **Locked, the comparative benchmark:** dated entry in [benchmarks.md](benchmarks.md) — correctness before
+  timing; same-run rows for the historical `Wfc.Engine` and the new generic-face route at matching sizes
+  (16×16 / 32×32 / 64×64, larger as fsi tolerates, toward the 500×500 target); ratios and scenario context,
+  not absolutes; the active power plan recorded in the env block per the 2026-07-10 convention.
+
+*Attention list (subtle, not extra rules):* restart must re-assert givens, and if the mechanism rebuilds,
+subscription disposal across rebuilds must not leak; compiled-table memory is per *distinct* relation —
+dedupe by shared relation box (the grid reuses 4 tables, not 4 × 250k) or the tables dwarf the store;
+sampling `allows` over dom×dom at lowering is |dom|² per distinct relation — fine at tile scale, worth a
+note in the file header; engine-copy headers must name their deltas (the standing rule: headers must not
+lie).
+
+*Acceptance:* every existing harness row passes unchanged **except** the relocated premise-width guard row,
+which is rewritten as specified in deliverable B; the new oracle rows pass; all scripts run clean under fsi;
+the benchmarks entry lands; §11 history appended (append-only per AGENTS.md).
+
+— Claude (Fable 5, Tier 0), 2026-07-10
+
+**Deen + Codex clarification, 2026-07-10 - Friendly owns the optimized outward UX.** The recut order's
+generalized finite face remains internal implementation machinery. Friendly is the coherent,
+low-cognitive-overhead surface for ordinary and optimized finite work: easy relations stay easy, while
+arbitrary n-ary relations, one relation over many scopes, custom topologies, seeded generation, and
+snapshot observation remain directly expressible and understandable. WFC contributes tiles,
+compatibility, grid topology, and presentation; it exercises these general capabilities without exposing
+model construction, lowering, representation, or engine plumbing.
+
+The enduring architecture and execution plan is
+[Generalized Finite Face and WFC Application Plan](propagator-finite-face-plan.md). It operationalizes the
+recut work order, records the grouped-`RelationBox` resolution, preserves the historical WFC implementation,
+and defines the phased correctness, UX, differential, and comparative-performance gates. The plan survives
+implementation; outcomes are appended to it rather than replacing it.
+
+-- Codex, 2026-07-10
+
+**Codex implementation status, 2026-07-10 - generalized finite face and WFC application complete.**
+The ratified plan is implemented. `Constraint.relations` and Friendly `RelateMany` represent one predicate
+over repeated scopes; Optimized uses one runtime-width cell-major bitset store, compiles grouped binary
+relations once into forward/reverse support rows, and retains generic GAC for arbitrary n-ary scopes.
+`solve` remains authored-order DDB with its 64-premise capability checked before search. `generate` is
+seeded bounded restart with premise-free collapse, a stable SplitMix64 stream, MRV, and a change-driven
+heap. Observation now emits `(Cell, CellState)` snapshots with a synchronous authored-order baseline.
+
+Friendly's Phase-5 audit found one authority per facade network: rich domains close over one `GeneralNet`;
+finite domains close over one `OptimizedNet`; the private operation record only delegates. There is no
+second mutable model and no propagation, reset, GAC, table, or observer mechanism in Friendly. The actual
+Phase-1 examples use only `Domain.finite`, `Cell`, `Relate`, `RelateMany`, `Given`, `Generate`, `Observe`,
+and their `Ops` equivalents. The new [WFC application](../propagator-wfc-app.fsx) keeps tile vocabulary,
+directions, grid topology, rendering, and validation local; its authoring path names no backend, lowering,
+representation, or engine concept. The historical [WFC prototype](../propagator-wfc.fsx) remains
+byte-for-byte unchanged (SHA-256 `836A49E4...357621`).
+
+This remains compatible with Sussman's propagator model at the semantic boundary: cells accumulate
+information monotonically through meet, propagators wake on changed cells and run to quiescence,
+contradiction is bottom, and premise support permits retraction and recomputation. Compiled support tables
+and multiword storage specialize execution without changing those laws. Seeded generation is deliberately
+an outer search strategy that resets/restarts the monotone kernel; it is not presented as a new primitive
+propagator operation or as API-level drop-in compatibility with a particular Sussman implementation.
+
+-- Codex, 2026-07-10
+
+**Codex benchmark clarification, 2026-07-11 - matching historical WFC constraints added.** The cyclic
+directional grid remains the readable application/UX proof, but it is no longer the only performance
+evidence. `propagator-wfc-app.fsx --benchmark-like-for-like` now runs the historical 500x500 gravity and
+3-color constraints through Friendly with seed 42, a retained network, pre-timing validity checks, one
+warmup, and generation-only timing. It reports best and mean and checks the final map again afterward.
+The application still owns every WFC-shaped rule; no matching concept moved into core.
+
+The preserved engine remains much faster on gravity, while the generalized Friendly route is much faster
+on 3-color in the observed Power-saver runs. This is useful workload evidence, not a single headline
+speedup: the old path returns an `int[]` and uses `System.Random`-shuffled DFS; Friendly returns the public
+immutable `Map` and uses stable SplitMix restart generation. Exact numbers and sampling boundaries are in
+`benchmarks.md`.
+
+-- Codex, 2026-07-11
+
 ## 11. Dated history
 
 - **2026-07-05 - Codex.** Added the current suggestion above: provisionally accept write-once authoring,
@@ -1167,6 +1339,73 @@ benchmark plan have been agreed.
   target are superseded; generic collapse/reset/observation needs require discussion; finite event payload,
   replay baseline, premise-width test relocation, stale stub notes, generation result shape, and comparative
   benchmark acceptance remain unresolved. No implementation was authorized by the review.
+
+- **2026-07-10 - Fable (Tier 0) reversal + recut work order.** Accepted the Codex recut review in full.
+  Fable's first response to finding 2 recommended keeping the fast machinery WFC-local; Deen challenged it
+  and the challenge held: the optimized face's 64-value single-word domain and tuple-enumerating GAC were
+  Sudoku-fixture overfit carried as architecture, and the historical `Wfc.Engine`'s machinery is generic
+  finite-CSP mechanism (multiword bitset domains, relations compiled to per-value support masks,
+  driver-side policy), mislabeled WFC-specific by its filename. Deen ratified: fix the core's finite story.
+  Replacement work order cut (§10), superseding the same-day third-slice order: (A) width-parameterized
+  multiword optimized face, binary relations compiled to mask tables at lowering, W=1 no-regression canary;
+  (B) `generate` under the surviving laws (verb split, premise invariant, pure seeded PRNG, one-map result),
+  preflight relocation with the guard row honestly rewritten, observation as `CellState` snapshots with a
+  subscribe-time baseline and last-write-wins replay; (C) new `propagator-wfc-app.fsx` (historical WFC file
+  preserved), domain-shaped Friendly authoring, four oracles, comparative same-run benchmark vs. the
+  prototype. Premise width ≤ 64 remains, honestly, a solve capability.
+
+- **2026-07-10 - Deen + Codex (durable generalized finite-face plan).** Clarified the final outward
+  boundary after the recut: Optimized is internal; Friendly must provide the clean low-overhead UX for
+  optimized finite execution as well as ordinary use; easy relations remain easy while arbitrary n-ary
+  relations, repeated scopes, custom topologies, generation, and observation remain understandable. Added
+  the signed enduring [Generalized Finite Face and WFC Application Plan](propagator-finite-face-plan.md),
+  including the grouped-relation resolution, hidden multiword implementation, WFC-only application boundary,
+  ordered phases, acceptance matrix, benchmark protocol, risks, and append-only execution record. The plan
+  is retained after implementation rather than treated as a compaction handoff.
+
+- **2026-07-10 - Fable (Tier 0) plan acceptance gate.** Accepted
+  [propagator-finite-face-plan.md](propagator-finite-face-plan.md) after a line-by-line check against the
+  recut work order; its "Ratified" header is true as of this gate. All locked rules survive intact. Two
+  Codex improvements over the order credited openly: the section-11.3 catch that the order's "may `#load`
+  the historical file" instruction was unworkable (the preserved file ends with `exit (main ())`), resolved
+  by a two-process comparative session with preservation ranked above benchmark convenience; and the
+  grouped-relation representation (`Constraint.relations`/`RelateMany`), which makes the order's mandated
+  per-distinct-relation table dedupe structural instead of hanging it on forbidden closure identity, plus
+  forward-and-reverse tables with an independent asymmetric-relation test. Watch items recorded in the
+  plan's section 13 for future gates: the Phase 5 Friendly delegation refactor (dual-mutable-model risk;
+  audit against the plan's own stop condition) and checking Phase 1's no-plumbing-nouns criterion against
+  the actual authored examples. Execution may proceed on the plan as written.
+
+- **2026-07-10 - Codex (generalized finite face implemented).** Completed the accepted recut and durable
+  plan: grouped relations; one runtime-width optimized store; compiled asymmetric binary support tables;
+  generic n-ary fallback; solve-time premise preflight; stable seeded generation; snapshot observation;
+  and a one-authority Friendly delegation record. The two Fable watch items passed their explicit audits:
+  no dual mutable model exists, and the concrete Friendly examples contain no backend/lowering/
+  representation nouns. Added the separate WFC-only application with independent map, cross-route seed,
+  replay, and bounded-failure oracles. Preserved the historical WFC file exactly. Correctness-gated
+  benchmarks and the controlled two-process historical comparison were appended to `benchmarks.md`.
+
+- **2026-07-11 - Codex (like-for-like WFC benchmark correction).** Added historical gravity and 3-color
+  constraints to the new WFC application's opt-in benchmark path at matching 500x500 dimensions and seed
+  42. Corrected the harness so independent validity walks occur outside the stopwatch, retained best/mean
+  sampling, and documented the remaining materialization/RNG/search-policy differences. No historical
+  source or core library code changed.
+
+- **2026-07-11 - Fable (Tier 0) implementation review gate + proposal acceptance.** Reviewed the completed
+  plan execution (phases 0-8) on primary evidence: both pre-flagged watch items pass — Friendly delegates
+  through one `CoreOperations` closure record per network with no second mutable model and no propagation
+  mechanics in the facade, and the actual WFC/UX examples contain no backend/lowering/representation
+  nouns (core-face calls confined to the permitted test-local oracle module). Locked rules verified in
+  code (one runtime-width store, per-group forward/reverse tables, premise-free collapse, seeded SplitMix
+  discipline, snapshot observation, honest premise split between lower/solve/generate). Historical WFC
+  SHA-256 re-verified independently; the full Friendly suite and all four WFC oracles ran green during
+  review. One non-blocking finding: the optimized facade's `cellPosition` linear scan (same
+  accidental-scan family as the fixed endpoint bug) should become a maintained dictionary. The 2026-07-11
+  gravity-optimization proposal in `benchmarks.md` is ACCEPTED with three executor notes recorded in the
+  plan's section 13: candidate 1 must empirically pass the seed-42 fingerprint despite being a model
+  change; candidate 3's shared scratch needs an observer re-entrancy stance first; candidate 2's cached
+  baseline is the riskiest item and needs an assert/retract-between-generates refresh test. Optimization
+  work may proceed on the proposal as written.
 
 ## 12. The dependency boundary and the observation split
 

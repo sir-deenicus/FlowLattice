@@ -294,3 +294,94 @@ Optimized rows execute minutes apart within one process, each at whatever freque
 hold, so under Power saver even within-run ratios move by 2x. Convention extension for future entries:
 record the active power plan (`powercfg /getactivescheme`) in the environment block, and prefer a
 high-performance plan on AC for recorded runs.
+
+---
+
+## 2026-07-10 - generalized finite face and WFC application
+
+- **Sources:** [propagator-friendly.tests.fsx](../propagator-friendly.tests.fsx),
+  [propagator-wfc-app.fsx](../propagator-wfc-app.fsx), and the preserved
+  [propagator-wfc.fsx](../propagator-wfc.fsx).
+- **Runtime:** .NET 9.0.12, `dotnet fsi`, optimizations off.
+- **Environment:** Windows Power saver plan
+  (`dac69671-8e57-4927-a427-73e20346dcc1`). Absolute values remain environmental observations.
+- **Correctness gate:** all pre-existing facade, rich-lattice, provenance, authored-order, sparse-DDB,
+  and capability rows passed, followed by grouped/expanded equivalence, 65/128/130-value domains,
+  asymmetric binary tables, SplitMix64 golden output, cross-face seeded generation, snapshot replay and
+  disposal, restart exhaustion, optimized live support/retraction, and the relocated premise guard.
+- **Preservation:** historical WFC SHA-256 before and after was
+  `836A49E4E511E23BE0A05A598403EBFE2E9512B1C1F82583B1FA8498FD357621`.
+
+The established same-process canary retained its order and included lowering plus solve. Baseline was
+captured before hot-loop changes in this same work session; final numbers are from the completed tree.
+
+| state | row | best us/run | mean us/run | same-process comparison |
+|---|---|---:|---:|---:|
+| before | General lower + solve | 40,537.6 | 45,214.1 | 1.00x |
+| before | Optimized lower + solve | 4,279.3 | 4,774.2 | 9.47x faster by best |
+| before | General live edit cycle | 42.8 | 52.6 | edit-only anchor |
+| final | General lower + solve | 32,651.1 | 36,149.4 | 1.00x |
+| final | Optimized lower + solve | 1,001.6 | 2,506.6 | 32.60x faster by best |
+| final | General live edit cycle | 27.9 | 38.4 | edit-only anchor |
+
+The new WFC ladder authors two grouped directional relations over a three-tile cyclic rule. Each row
+includes deferred lowering, generation, and immutable `Solution Map` materialization, then independently
+walks every adjacency. It is a single correctness-gated process, not repeated statistical sampling.
+
+| new Friendly WFC grid | elapsed ms | valid |
+|---|---:|---:|
+| 16x16 | 10.015 | yes |
+| 32x32 | 13.456 | yes |
+| 64x64 | 76.284 | yes |
+| 128x128 | 152.815 | yes |
+| 500x500 | 6,672.822 | yes |
+
+The first 500x500 attempt exposed an application-scale authoring bug: optimized structural validation
+linearly scanned all cells for every relation endpoint. A cell-id set removed that accidental quadratic
+cost. Before the fix, two controlled attempts failed to complete within six and five minutes; after it,
+the complete ladder and 500x500 row passed. The change-driven picker also tracks unresolved and bottom
+counts, avoiding a drain of stale heap entries after a propagation wave.
+
+The preserved historical script then ran as a second process with `TRIALS=1` (its retract helper retains
+hard-coded best-of-3 sampling). All historical correctness rows passed. Selected results:
+
+| preserved historical workload | best ms/run |
+|---|---:|
+| ramp512 corner 500x500 | 6,628.095 |
+| ramp128 center 500x500 | 138.122 |
+| gravity generation 500x500 | 363.597 |
+| 3-color generation 500x500 | 54,743.329 |
+| ramp32 generation 64x64 | 135.968 |
+
+These are consecutive-process historical comparisons, not same-process rows. The new cyclic directional
+map, historical gravity, 3-color, and ramp workloads have different propagation and search shapes; no
+cross-row speedup is claimed. Their value is boundary evidence: the historical prototype remains intact,
+while the new application reaches a valid 250,000-cell map through Friendly with no local propagator
+engine or hidden representation API.
+
+---
+
+## 2026-07-11 addendum - matching gravity and 3-color WFC constraints
+
+The preceding entry correctly refused to compare unlike cyclic, gravity, and 3-color workloads, but left
+the comparative proof incomplete. The new application's `--benchmark-like-for-like` mode now reproduces
+the historical gravity and 3-color constraint semantics at 500x500 with seed 42.
+
+For gravity, `Sea` represents historical Air and `Coast` represents Ground. East/west is unconstrained;
+the authored south relation is `upper = Air || lower = Ground`, and its compiled reverse arc supplies the
+corresponding north propagation. The 3-color relation is inequality on every horizontal and vertical edge.
+Both routes retain one already-built network, perform a validity spot check, warm up once, time generation,
+and validate the final materialized map outside the stopwatch. The Friendly run used two measured trials;
+gravity used two iterations per trial and 3-color one, matching the historical per-trial iteration counts.
+
+| 500x500, seed 42 | preserved best ms | Friendly best ms | Friendly mean ms | observed best ratio |
+|---|---:|---:|---:|---:|
+| gravity generation | 363.597 | 5,959.679 | 6,174.909 | preserved 16.39x faster |
+| 3-color generation | 54,743.329 | 4,958.214 | 5,155.247 | Friendly 11.04x faster |
+
+All maps passed an independent adjacency walk. The comparison is constraint-, dimension-, and seed-matched,
+but not mechanically identical: the preserved path materializes `int[]`, uses `System.Random` candidate
+shuffles and trail-backed DFS, and was recorded with one measured trial; Friendly materializes the public
+immutable `Map`, uses stable SplitMix uniform choices with bounded restart, and reports two measured trials.
+The runs were separate Power-saver processes on different dates. Therefore the ratios describe these
+observations and the strong workload reversal; they are not stable cross-machine speedup claims.
