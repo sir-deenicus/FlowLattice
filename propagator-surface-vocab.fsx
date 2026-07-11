@@ -1,8 +1,8 @@
 (*  propagator-surface-vocab.fsx
 
-    The two-faces surface: one authored Model, two lowerings, and the differential harness that
-    proves they agree. Design: docs/propagator-surface-design.md (§5 vocabulary, §7 decided,
-    §10 Codex + Fable review).
+    The propagator core: one authored Model and two lowering faces. The differential harness,
+    friendly regressions, and proof slices live in propagator-friendly.tests.fsx. Design:
+    docs/propagator-surface-design.md (§5 vocabulary, §7 decided, §10 Codex + Fable review).
 
     Started life (2026-07-05) as Codex build-order step 1 — "write the concrete F# signatures
     first" — a signatures-only skeleton with every body a `failwith` stub. This file now FILLS
@@ -22,19 +22,20 @@
     (a caller-supplied `FiniteRep` on General, a `uint64` word on Optimized). Identical narrowing => identical fixpoint =>
     identical solution; that agreement is exactly what `Differential.solveBoth` asserts.
 
-    solveBoth is the TEST HARNESS, not the shipped surface (docs §7.8, Deen 2026-07-06). A consumer
-    picks a face and never calls it; it lowers to BOTH and diffs, so it belongs with the tests.
+    solveBoth is TEST HARNESS code, not the shipped surface (docs §7.8, Deen 2026-07-06), and is
+    therefore defined only in the separate test script.
 
     Sharpening 1 (Fable): capability witnesses are ordinary lowering RETURN TYPES
       (Result<_, UnsupportedConstruct list>) — legality is visible before any engine is built. The
       C<->F slice proves it: `Optimized.lower` returns [RichLatticeOnOptimized; DataflowOnOptimized].
 
     Core/outer boundary (Deen, 2026-07-05): the line is the `#r` — everything here is pure F# (core).
-      The two engines are copied in verbatim (the repo pattern: literate files carry their engine, they
-      do not `#load` a file that ends in `exit (main())`).
+      This file is deliberately load-safe: friendly syntax and tests consume this single engine and
+      vocabulary definition through `#load`.
 
-    Still stubbed (the observation/edit seams — NOT this slice's scope): `solutions` / `generate` /
-    `onCell` / `onNet` / `assume` / `retract`. They are the deferred observation slice (docs §9, §12).
+    Still stubbed (the streaming seams): `solutions` / `generate` / `onCell` / `onNet`. General
+    cell reads, support inspection, assumptions, and retraction retain one live closure engine;
+    optimized observation/edit remains part of the deferred slice (docs §9, §12).
 
     Guardrail fix (Codex review, 2026-07-06): lowerings now reject every unsupported construct/domain
     combination as an `UnsupportedConstruct` value instead of silently ignoring it, and the optimized
@@ -46,7 +47,7 @@
     proves that search is required, both faces agree, and the authored puzzle is uniquely solvable by an
     independent exhaustive enumerator.
 
-      dotnet fsi propagator-surface-vocab.fsx  *)
+      dotnet fsi propagator-friendly.tests.fsx  *)
 
 
 open System.Collections.Generic
@@ -71,7 +72,7 @@ type LatticeOps<'a> =
       equals: 'a -> 'a -> bool }
 
 /// The operations General needs from a finite-domain representation. The representation state is
-/// deliberately separate from the authored value type and is hidden again by `GeneralNet.run`.
+/// deliberately separate from the authored value type and stays hidden behind `GeneralNet`.
 type FiniteRep<'value, 'state> =
     { top: 'state
       ofValues: 'value list -> 'state
@@ -84,10 +85,23 @@ type FiniteRep<'value, 'state> =
 
 /// A value domain. The portability class is visible in the case:
 ///   Finite  — rep-agnostic, PORTABLE (supplied General rep / optimized bitset).
-///   Lattice — rich meet (interval, scalar), FRIENDLY-ONLY by construction.
+///   Lattice — rich meet (interval, scalar), GENERAL-ONLY by construction.
 type Domain<'a> =
     | Finite of 'a list
     | Lattice of LatticeOps<'a>
+
+/// A simple equality lattice: Top is unknown, Val is known, and conflicting values meet at Bot.
+type Scalar<'value> =
+    | Top
+    | Val of 'value
+    | Bot
+
+let scalarMeet left right =
+    match left, right with
+    | Top, value | value, Top -> value
+    | Bot, _ | _, Bot -> Bot
+    | Val a, Val b when a = b -> Val a
+    | Val _, Val _ -> Bot
 
 
 // ---- Spine (constraint boxes) -------------------------------------------
@@ -99,12 +113,13 @@ type RelationBox<'a> =
     { cells: Cell<'a> list
       allows: 'a list -> bool }
 
-/// A general-only rich dataflow relation (convert / sum / equal over lattices):
-/// a directional narrowing that needs the lattice meet machinery. `narrow` returns each cell's
-/// freshly-derived value; the engine meets it in.
+/// A general-only rich dataflow relation (convert / sum / equal over lattices). `cells` are reads,
+/// `outputs` are targets, and each optional result is a freshly-derived contribution. `None` emits
+/// nothing, preserving an independent target value when a source is uninformative.
 type DataflowBox<'a> =
     { cells: Cell<'a> list
-      narrow: 'a list -> 'a list }
+      outputs: Cell<'a> list
+      narrow: 'a list -> 'a option list }
 
 /// A constraint box. Portability class is visible in the case:
 ///   Relation → portable    Dataflow → general-only
@@ -141,10 +156,25 @@ type UnsupportedConstruct =
 /// An assignment of each cell to a value in its domain.
 type Solution<'a> = Map<Cell<'a>, 'a>
 
-/// A lowered FRIENDLY network (≈ the closure engine dressed): clear rep, closure props, rich
-/// lattices. Search = dependency-directed backtracking (fork A). `run` is the built, ready-to-solve
-/// engine captured as a closure; `General.solve` just calls it.
-type GeneralNet<'a> = { model: Model<'a>; run: unit -> Solution<'a> option }
+/// A representation-independent view of a live general cell. Finite candidates retain authored
+/// order; rich lattices expose their current value directly. The backend representation stays hidden.
+type CellState<'a> =
+    | FiniteCandidates of 'a list
+    | LatticeValue of 'a
+
+/// A lowered GENERAL network. Its private closures retain one live closure engine so reads, edits,
+/// retraction, and search all operate on the same propagated state without rebuilding a Model.
+type GeneralNet<'a> =
+    private
+        { domain: Domain<'a>
+          addCell: string -> Cell<'a>
+          addConstraint: Constraint<'a> -> unit
+          freshPremise: unit -> Premise
+          assertState: Premise -> Cell<'a> -> CellState<'a> -> unit
+          retractPremise: Premise -> unit
+          readState: Cell<'a> -> CellState<'a>
+          readSupport: Cell<'a> -> Set<Premise>
+          run: unit -> Solution<'a> option }
 
 /// A lowered OPTIMIZED network (≈ the array core dressed): flat-word rep, array-backed store.
 /// Same verb, different machinery (D2). `run` captures the built array-core engine.
@@ -211,8 +241,50 @@ module Constraint =
 
     /// A general-only rich dataflow relation.
     let dataflow (cells: Cell<'a> list) (narrow: 'a list -> 'a list) : Constraint<'a> =
-        Dataflow { cells = cells; narrow = narrow }
+        Dataflow { cells = cells; outputs = cells; narrow = narrow >> List.map Some }
 
+    /// A pair of directional rich-lattice propagators. An uninformative source emits no
+    /// contribution, preserving the target's independent state and provenance.
+    let convert
+        (left: Cell<'a>)
+        (right: Cell<'a>)
+        (payload: 'a -> 'payload option)
+        (inject: 'payload -> 'a)
+        (forward: 'payload -> 'payload)
+        (backward: 'payload -> 'payload)
+        : Constraint<'a> list =
+        [ Dataflow
+              { cells = [ left ]
+                outputs = [ right ]
+                narrow = function
+                    | [ value ] -> [ payload value |> Option.map (forward >> inject) ]
+                    | _ -> invalidArg "values" "convert forward expected one source value" }
+          Dataflow
+              { cells = [ right ]
+                outputs = [ left ]
+                narrow = function
+                    | [ value ] -> [ payload value |> Option.map (backward >> inject) ]
+                    | _ -> invalidArg "values" "convert backward expected one source value" } ]
+
+    /// A directional fan-in. It emits only when every source has an informative payload.
+    let combine
+        (sources: Cell<'a> list)
+        (target: Cell<'a>)
+        (payload: 'a -> 'payload option)
+        (inject: 'payload -> 'a)
+        (operation: 'payload list -> 'payload)
+        : Constraint<'a> =
+        Dataflow
+            { cells = sources
+              outputs = [ target ]
+              narrow = fun values ->
+                  let projected = List.map payload values
+                  if List.forall Option.isSome projected then
+                      [ projected |> List.map Option.get |> operation |> inject |> Some ]
+                  else
+                      [ None ] }
+
+    /// The portable all-different relation used by the friendly finite shorthand.
 // ---- A rich lattice value type used by the general-only slice (verbatim) ----
 // Copied from propagator-friendly.fsx / propagator-number-types.fsx §4: meet = intersection,
 // Bot = Empty, outward-rounded arithmetic. Only the C<->F slice uses it.
@@ -251,12 +323,45 @@ module Interval =
         | Iv(a0, a1), Iv(b0, b1) ->
             let qs = [ a0 / b0; a0 / b1; a1 / b0; a1 / b1 ]
             Iv(down (List.min qs), up (List.max qs))
+    let sqrt a =
+        match a with
+        | Empty -> Empty
+        | Iv(_, hi) when hi < 0.0 -> Empty
+        | Iv(lo, hi) ->
+            let lower = if lo <= 0.0 then 0.0 else down (System.Math.Sqrt lo)
+            Iv(lower, up (System.Math.Sqrt hi))
+
+type Interval with
+    static member (+) (left: Interval, right: Interval) = Interval.add left right
+    static member (-) (left: Interval, right: Interval) = Interval.sub left right
+    static member (*) (left: Interval, right: Interval) = Interval.mul left right
+    static member (/) (left: Interval, right: Interval) = Interval.div left right
+    static member (+) (left: Interval, right: float) = Interval.add left (Interval.pt right)
+    static member (+) (left: float, right: Interval) = Interval.add (Interval.pt left) right
+    static member (-) (left: Interval, right: float) = Interval.sub left (Interval.pt right)
+    static member (-) (left: float, right: Interval) = Interval.sub (Interval.pt left) right
+    static member (*) (left: Interval, right: float) = Interval.mul left (Interval.pt right)
+    static member (*) (left: float, right: Interval) = Interval.mul (Interval.pt left) right
+    static member (/) (left: Interval, right: float) = Interval.div left (Interval.pt right)
+    static member (/) (left: float, right: Interval) = Interval.div (Interval.pt left) right
+    static member Sqrt (value: Interval) = Interval.sqrt value
+
+module Transform =
+    let scale (factor: float) = fun value -> value * factor
+    let shift (offset: float) = fun value -> value + offset
+    let affine factor offset = scale factor >> shift offset
+
+    type Affine =
+        { k: float
+          b: float }
+        member transform.Apply value = transform.k * value + transform.b
+        member transform.Inverse = { k = 1.0 / transform.k; b = -transform.b / transform.k }
 
 
 // ---- Backend engines (the two lowering targets, copied and adapted) -----
 // Their internal `Cell` differs from the public handle above, so each is nested and private.
 
-/// The FRIENDLY backend: the closure `Engine<'a>` of tutorial-propagation-part1.fsx (its 7a-7e),
+/// The GENERAL backend: the closure `Engine<'a>` of tutorial-propagation-part1.fsx (its 7a-7e),
 /// with one integration delta: lattice-supplied equality replaces the source engine's `'a : equality`
 /// constraint and generic comparisons. Clear rep, closure props, premises + Retract.
 module private Closure =
@@ -474,100 +579,273 @@ let private optimizedWidthErrors (values: 'a list) (model: Model<'a>) =
 
 module General =
 
+    let private unsupported (model: Model<'a>) =
+        [ for constraintBox in model.constraints do
+              match model.domain, constraintBox with
+              | Finite _, Dataflow _ -> yield DataflowRequiresRichLattice
+              | Lattice _, Relation _ -> yield RelationRequiresFiniteDomain
+              | _ -> () ]
+
+    let private publicSupport (support: Set<int>) : Set<Premise> =
+        support |> Seq.map (fun pid -> { pid = pid }) |> Set.ofSeq
+
+    let private finiteNet
+        (rep: FiniteRep<'a, 'state>)
+        (model: Model<'a> when 'a : comparison)
+        : GeneralNet<'a> =
+        let lattice : Closure.Lattice<'state> =
+            { top = rep.top; meet = rep.meet; equals = rep.equals }
+        let eng = Closure.Engine<'state>(lattice)
+        let emap = Dictionary<int, Closure.Cell<'state>>()
+        let cells = ResizeArray<Cell<'a>>()
+        let authoredValues = match model.domain with Finite values -> values | _ -> []
+        let allowed = HashSet<'a>(authoredValues)
+        let mutable nextPremise = 0
+
+        let addExisting (cell: Cell<'a>) =
+            if emap.ContainsKey cell.id then invalidArg "cell" "cell is already part of this network"
+            emap.[cell.id] <- eng.NewCell ()
+            cells.Add cell
+
+        let ecell (cell: Cell<'a>) =
+            match emap.TryGetValue cell.id with
+            | true, found -> found
+            | _ -> invalidArg "cell" "cell does not belong to this network"
+
+        let addCell name =
+            let cell = Cell.create name
+            addExisting cell
+            cell
+
+        let addConstraint constraintBox =
+            match constraintBox with
+            | Relation box ->
+                let engineCells = box.cells |> List.map ecell
+                eng.AddProp(engineCells, fun () ->
+                    let candidates = engineCells |> List.map (fun cell -> rep.candidates cell.value)
+                    let narrowed = Gac.narrow box.allows candidates
+                    let support = engineCells |> List.map (fun cell -> cell.support) |> Set.unionMany
+                    List.map2 (fun (cell: Closure.Cell<'state>) values ->
+                        cell, { Closure.value = rep.ofValues values; Closure.support = support }) engineCells narrowed)
+                |> ignore
+            | Dataflow _ -> invalidOp "Dataflow constraints require a rich lattice domain"
+
+        let freshPremise () =
+            let premise = { pid = nextPremise }
+            nextPremise <- nextPremise + 1
+            premise
+
+        let assertState premise cell state =
+            if premise.pid < 0 then invalidArg "premise" "premise ids must be non-negative"
+            nextPremise <- max nextPremise (premise.pid + 1)
+            match state with
+            | FiniteCandidates values ->
+                if values |> List.exists (allowed.Contains >> not) then
+                    invalidArg "state" "candidate is not in the authored finite domain"
+                eng.Assert(premise.pid, ecell cell, rep.ofValues values)
+            | LatticeValue _ -> invalidArg "state" "finite networks require FiniteCandidates"
+
+        let run () =
+            let engineCells = cells |> Seq.map (fun cell -> cell, ecell cell) |> Seq.toList
+            let anyBottom () = engineCells |> List.exists (fun (_, cell) -> rep.isBottom cell.value)
+            let rec search () =
+                if anyBottom () then false
+                else
+                    match engineCells |> List.tryFind (fun (_, cell) ->
+                              not (rep.isBottom cell.value) && not (rep.isSingleton cell.value)) with
+                    | None -> true
+                    | Some (_, cell) ->
+                        let rec tryValues = function
+                            | [] -> false
+                            | value :: rest ->
+                                let premise = nextPremise
+                                nextPremise <- premise + 1
+                                eng.Assert(premise, cell, rep.singleton value)
+                                if search () then true
+                                else
+                                    eng.Retract premise
+                                    nextPremise <- premise
+                                    tryValues rest
+                        tryValues (rep.candidates cell.value)
+            if search () then
+                engineCells
+                |> List.map (fun (publicCell, engineCell) ->
+                    publicCell, List.head (rep.candidates engineCell.value))
+                |> Map.ofList
+                |> Some
+            else
+                None
+
+        model.cells |> List.iter addExisting
+        model.constraints |> List.iter addConstraint
+        model.givens
+        |> List.iter (fun (cell, value) ->
+            let premise = freshPremise ()
+            assertState premise cell (FiniteCandidates [ value ]))
+
+        { domain = model.domain
+          addCell = addCell
+          addConstraint = addConstraint
+          freshPremise = freshPremise
+          assertState = assertState
+          retractPremise = fun premise -> eng.Retract premise.pid
+          readState = fun cell -> FiniteCandidates (rep.candidates (ecell cell).value)
+          readSupport = fun cell -> publicSupport (ecell cell).support
+          run = run }
+
+    let private latticeNet (ops: LatticeOps<'a>) (model: Model<'a>) : GeneralNet<'a> =
+        let lattice : Closure.Lattice<'a> =
+            { top = ops.top; meet = ops.meet; equals = ops.equals }
+        let eng = Closure.Engine<'a>(lattice)
+        let emap = Dictionary<int, Closure.Cell<'a>>()
+        let cells = ResizeArray<Cell<'a>>()
+        let mutable nextPremise = 0
+
+        let addExisting (cell: Cell<'a>) =
+            if emap.ContainsKey cell.id then invalidArg "cell" "cell is already part of this network"
+            emap.[cell.id] <- eng.NewCell ()
+            cells.Add cell
+
+        let ecell (cell: Cell<'a>) =
+            match emap.TryGetValue cell.id with
+            | true, found -> found
+            | _ -> invalidArg "cell" "cell does not belong to this network"
+
+        let addCell name =
+            let cell = Cell.create name
+            addExisting cell
+            cell
+
+        let addConstraint constraintBox =
+            match constraintBox with
+            | Dataflow box ->
+                let reads = box.cells |> List.map ecell
+                let outputs = box.outputs |> List.map ecell
+                eng.AddProp(reads, fun () ->
+                    let values = reads |> List.map (fun cell -> cell.value)
+                    let derived = box.narrow values
+                    if List.length derived <> List.length outputs then
+                        invalidOp "dataflow output count does not match its target count"
+                    let support = reads |> List.map (fun cell -> cell.support) |> Set.unionMany
+                    List.zip outputs derived
+                    |> List.choose (fun (cell, value) ->
+                        value
+                        |> Option.map (fun narrowed ->
+                            cell, { Closure.value = narrowed; Closure.support = support })))
+                |> ignore
+            | Relation _ -> invalidOp "Relation constraints require a finite domain"
+
+        let freshPremise () =
+            let premise = { pid = nextPremise }
+            nextPremise <- nextPremise + 1
+            premise
+
+        let assertState premise cell state =
+            if premise.pid < 0 then invalidArg "premise" "premise ids must be non-negative"
+            nextPremise <- max nextPremise (premise.pid + 1)
+            match state with
+            | LatticeValue value -> eng.Assert(premise.pid, ecell cell, value)
+            | FiniteCandidates _ -> invalidArg "state" "rich lattice networks require LatticeValue"
+
+        let run () =
+            let settled = cells |> Seq.map (fun cell -> cell, (ecell cell).value) |> Seq.toList
+            if settled |> List.exists (fun (_, value) -> ops.isBottom value) then None
+            else Some (Map.ofList settled)
+
+        model.cells |> List.iter addExisting
+        model.constraints |> List.iter addConstraint
+        model.givens
+        |> List.iter (fun (cell, value) ->
+            let premise = freshPremise ()
+            assertState premise cell (LatticeValue value))
+
+        { domain = model.domain
+          addCell = addCell
+          addConstraint = addConstraint
+          freshPremise = freshPremise
+          assertState = assertState
+          retractPremise = fun premise -> eng.Retract premise.pid
+          readState = fun cell -> LatticeValue (eng.Value (ecell cell))
+          readSupport = fun cell -> publicSupport (ecell cell).support
+          run = run }
+
     /// Lower with a caller-supplied finite representation. The representation state remains internal
-    /// to the captured engine and does not appear in the returned net or solution.
+    /// to the captured engine and does not appear in the returned net, cell state, or solution.
     let lowerWith
         (makeFiniteRep: 'a list -> FiniteRep<'a, 'state>)
         (model: Model<'a> when 'a : comparison)
         : Result<GeneralNet<'a>, UnsupportedConstruct list> =
-        let unsupported =
-            [ for c in model.constraints do
-                match model.domain, c with
-                | Finite _, Dataflow _ -> yield DataflowRequiresRichLattice
-                | Lattice _, Relation _ -> yield RelationRequiresFiniteDomain
-                | _ -> () ]
-        if not (List.isEmpty unsupported) then Error unsupported
+        let errors = unsupported model
+        if not (List.isEmpty errors) then Error errors
         else
             match model.domain with
-            | Finite values ->
-                let rep = makeFiniteRep values
-                let lattice : Closure.Lattice<'state> =
-                    { top = rep.top; meet = rep.meet; equals = rep.equals }
-                let eng = Closure.Engine<'state>(lattice)
-                let emap = Dictionary<int, Closure.Cell<'state>>()
-                for pc in model.cells do emap.[pc.id] <- eng.NewCell ()
-                let ecell (pc: Cell<'a>) = emap.[pc.id]
-                for c in model.constraints do
-                    match c with
-                    | Relation box ->
-                        let ecs = box.cells |> List.map ecell
-                        eng.AddProp(ecs, fun () ->
-                            let cand = ecs |> List.map (fun c -> rep.candidates c.value)
-                            let narrowed = Gac.narrow box.allows cand
-                            let sup = ecs |> List.map (fun c -> c.support) |> Set.unionMany
-                            List.map2 (fun (c: Closure.Cell<'state>) vs ->
-                                c, { Closure.value = rep.ofValues vs; Closure.support = sup }) ecs narrowed) |> ignore
-                    | Dataflow _ -> failwith "preflight missed unsupported general finite constraint"
-                model.givens |> List.iteri (fun i (pc, v) -> eng.Assert(i, ecell pc, rep.singleton v))
-                let run () =
-                    let ecells = model.cells |> List.map (fun pc -> pc, ecell pc)
-                    let anyBot () = ecells |> List.exists (fun (_, c) -> rep.isBottom c.value)
-                    let mutable gp = List.length model.givens
-                    let rec go () =
-                        if anyBot () then false
-                        else
-                            match ecells |> List.tryFind (fun (_, c) ->
-                                      not (rep.isBottom c.value) && not (rep.isSingleton c.value)) with
-                            | None -> true
-                            | Some (_, c) ->
-                                let rec tryV lst =
-                                    match lst with
-                                    | [] -> false
-                                    | v :: rest ->
-                                        let p = gp in gp <- gp + 1
-                                        eng.Assert(p, c, rep.singleton v)
-                                        if go () then true
-                                        else
-                                            eng.Retract p
-                                            gp <- p
-                                            tryV rest
-                                tryV (rep.candidates c.value)
-                    if go () then
-                        Some (ecells |> List.map (fun (pc, c) -> pc, List.head (rep.candidates c.value)) |> Map.ofList)
-                    else None
-                Ok { model = model; run = run }
-            | Lattice ops ->
-                let latticeRich : Closure.Lattice<'a> =
-                    { top = ops.top; meet = ops.meet; equals = ops.equals }
-                let eng = Closure.Engine<'a>(latticeRich)
-                let emap = Dictionary<int, Closure.Cell<'a>>()
-                for pc in model.cells do emap.[pc.id] <- eng.NewCell ()
-                let ecell (pc: Cell<'a>) = emap.[pc.id]
-                for c in model.constraints do
-                    match c with
-                    | Dataflow box ->
-                        let ecs = box.cells |> List.map ecell
-                        eng.AddProp(ecs, fun () ->
-                            let vals = ecs |> List.map (fun c -> c.value)
-                            let derived = box.narrow vals
-                            let sup = ecs |> List.map (fun c -> c.support) |> Set.unionMany
-                            List.map2 (fun (c: Closure.Cell<'a>) v ->
-                                c, { Closure.value = v; Closure.support = sup }) ecs derived) |> ignore
-                    | Relation _ -> failwith "preflight missed unsupported general lattice constraint"
-                model.givens |> List.iteri (fun i (pc, v) -> eng.Assert(i, ecell pc, v))
-                let run () =
-                    let settled = model.cells |> List.map (fun pc -> pc, (ecell pc).value)
-                    if settled |> List.exists (fun (_, v) -> ops.isBottom v) then None
-                    else Some (Map.ofList settled)
-                Ok { model = model; run = run }
+            | Finite values -> Ok (finiteNet (makeFiniteRep values) model)
+            | Lattice ops -> Ok (latticeNet ops model)
 
     /// Friendly finite-domain default. All lowering logic remains in `lowerWith`; this wrapper only
     /// selects the Set adapter.
     let lower (model: Model<'a> when 'a : comparison) : Result<GeneralNet<'a>, UnsupportedConstruct list> =
         lowerWith FiniteRep.set model
 
+    /// Start an empty live general network. Added cells and constraints are installed directly in
+    /// its retained closure engine.
+    let create (domain: Domain<'a> when 'a : comparison) : GeneralNet<'a> =
+        let model = { domain = domain; cells = []; constraints = []; givens = [] }
+        match domain with
+        | Finite values -> finiteNet (FiniteRep.set values) model
+        | Lattice ops -> latticeNet ops model
+
+    /// Start an empty live rich-lattice network without imposing a comparison constraint on its values.
+    let createLattice (domain: Domain<'a>) : GeneralNet<'a> =
+        match domain with
+        | Lattice ops ->
+            latticeNet ops { domain = domain; cells = []; constraints = []; givens = [] }
+        | Finite _ -> invalidArg "domain" "createLattice requires a rich lattice domain"
+
+    /// Start an empty live finite network using the friendly Set representation default.
+    let createFinite (values: 'a list when 'a : comparison) : GeneralNet<'a> =
+        let domain = Domain.finite values
+        finiteNet (FiniteRep.set values) { domain = domain; cells = []; constraints = []; givens = [] }
+
+    let cell (net: GeneralNet<'a>) (name: string) : Cell<'a> = net.addCell name
+
+    let constrain (net: GeneralNet<'a>) (constraintBox: Constraint<'a>) : unit =
+        net.addConstraint constraintBox
+
+    let convert net left right payload inject forward backward =
+        Constraint.convert left right payload inject forward backward
+        |> List.iter net.addConstraint
+
+    let combine net sources target payload inject operation =
+        Constraint.combine sources target payload inject operation
+        |> net.addConstraint
+
+    let freshPremise (net: GeneralNet<'a>) : Premise = net.freshPremise ()
+
+    let assertStateUnder
+        (net: GeneralNet<'a>)
+        (premise: Premise)
+        (cell: Cell<'a>)
+        (state: CellState<'a>)
+        : unit =
+        net.assertState premise cell state
+
+    let assertUnder (net: GeneralNet<'a>) (premise: Premise) (cell: Cell<'a>) (value: 'a) : unit =
+        match net.domain with
+        | Finite _ -> net.assertState premise cell (FiniteCandidates [ value ])
+        | Lattice _ -> net.assertState premise cell (LatticeValue value)
+
     /// One solution (DDB on the closure engine: guess = Assert under a fresh premise, backtrack = Retract).
     let solve (net: GeneralNet<'a>) : Solution<'a> option = net.run ()
+
+    let solveFinite (net: GeneralNet<'a>) : bool =
+        match net.domain with
+        | Finite _ -> net.run () |> Option.isSome
+        | Lattice _ -> invalidOp "Solve requires a finite domain (build the network with Domain.finite)"
+
+    let value (net: GeneralNet<'a>) (cell: Cell<'a>) : CellState<'a> = net.readState cell
+
+    let support (net: GeneralNet<'a>) (cell: Cell<'a>) : Set<Premise> = net.readSupport cell
 
     // ---- Observation / edit seams — the deferred observation slice, still stubbed (docs §9, §12) ----
 
@@ -578,9 +856,11 @@ module General =
     let onNet (net: GeneralNet<'a>) (handler: CellChange<'a> -> unit) : System.IDisposable =
         failwith "deferred: observation slice (expose OnChange net-wide)"
     let assume (net: GeneralNet<'a>) (cell: Cell<'a>) (value: 'a) : Premise =
-        failwith "deferred: edit slice (Assert under fresh premise)"
+        let premise = net.freshPremise ()
+        assertUnder net premise cell value
+        premise
     let retract (net: GeneralNet<'a>) (premise: Premise) : unit =
-        failwith "deferred: edit slice (Retract premise)"
+        net.retractPremise premise
 
 
 // ---- Optimized face ------------------------------------------------------
@@ -675,334 +955,3 @@ module Optimized =
         failwith "deferred: edit slice (Assert under fresh premise)"
     let retract (net: OptimizedNet<'a>) (premise: Premise) : unit =
         failwith "deferred: edit slice (cone-local Retract)"
-
-
-// ---- Differential harness (TEST HARNESS, not shipped surface — docs §7.8) --------
-// The whole two-faces claim in one call: same model, both faces, equal solutions. A consumer
-// picks a face and never calls this; it lives here with the tests, where paying for both engines
-// per model is a CI cost, not a hot-path cost.
-
-module Differential =
-
-    /// Lower a model to BOTH faces and solve each. Portability failures on either face are returned
-    /// as data; when both lower, the pair comes back for the caller to diff.
-    let solveBoth (model: Model<'a> when 'a : comparison)
-                  : Result<Solution<'a> option * Solution<'a> option, UnsupportedConstruct list> =
-        match General.lower model, Optimized.lower model with
-        | Ok fnet, Ok onet -> Ok (General.solve fnet, Optimized.solve onet)
-        | Error e, Ok _ -> Error e
-        | Ok _, Error e -> Error e
-        | Error e1, Error e2 -> Error (List.append e1 e2)
-
-// ---- The two proof slices (now runnable) --------------------------------
-
-module private Slices =
-
-    /// Slice 1 — Celsius/Fahrenheit: general-only dataflow over the rich interval lattice.
-    /// Lowers on the general face (settles to F ~ [33.8, 33.8]); `Optimized.lower` returns
-    /// [RichLatticeOnOptimized; DataflowOnOptimized] — general-only, visible pre-engine.
-    let celsiusFahrenheit () : Model<Interval> =
-        let c = Cell.create "celsius"
-        let f = Cell.create "fahrenheit"
-        let dom = Domain.lattice Interval.entire Interval.meet (fun iv -> iv = Empty)
-        let cToF iv = Interval.add (Interval.div (Interval.mul iv (Interval.pt 9.0)) (Interval.pt 5.0)) (Interval.pt 32.0)
-        let fToC iv = Interval.div (Interval.mul (Interval.sub iv (Interval.pt 32.0)) (Interval.pt 5.0)) (Interval.pt 9.0)
-        let convert =
-            Constraint.dataflow [ c; f ] (fun vs ->
-                match vs with
-                | [ cv; fv ] -> [ fToC fv; cToF cv ]   // each cell's freshly-derived value; engine meets it in
-                | _ -> vs)
-        { domain = dom; cells = [ c; f ]; constraints = [ convert ]; givens = [ c, Interval.pt 1.0 ] }
-
-    let private sudoku4WithGivens
-        (encodeUnit: Cell<int> list -> Constraint<int> list)
-        (givens: ((int * int) * int) list)
-        : Model<int> =
-        let cells = List.init 16 (fun i -> (Cell.create (sprintf "r%dc%d" (i / 4) (i % 4)) : Cell<int>))
-        let at r c = List.item (r * 4 + c) cells
-        let rows  = [ for r in 0 .. 3 -> [ for c in 0 .. 3 -> at r c ] ]
-        let colsC = [ for c in 0 .. 3 -> [ for r in 0 .. 3 -> at r c ] ]
-        let boxes = [ for br in 0 .. 1 do for bc in 0 .. 1 -> [ for dr in 0 .. 1 do for dc in 0 .. 1 -> at (2*br+dr) (2*bc+dc) ] ]
-        let constraints = rows @ colsC @ boxes |> List.collect encodeUnit
-        let authoredGivens = givens |> List.map (fun ((r, c), v) -> at r c, v)
-        { domain = Domain.finite [1..4]
-          cells = cells
-          constraints = constraints
-          givens = authoredGivens }
-
-    let private globalAllDifferent group =
-        [ Constraint.relation group (fun vs -> List.length (List.distinct vs) = List.length vs) ]
-
-    let private pairwiseNotEqual group =
-        [ for i in 0 .. List.length group - 2 do
-              for j in i + 1 .. List.length group - 1 ->
-                  Constraint.relation [ List.item i group; List.item j group ] (function
-                      | [ a; b ] -> a <> b
-                      | _ -> false) ]
-
-    /// Slice 2 — 4x4 Sudoku: portable finite CSP. Twelve all-different relations + eight givens,
-    /// the same instance the other engines solve; lowers through BOTH faces.
-    let sudoku4 () : Model<int> =
-        sudoku4WithGivens globalAllDifferent
-            [ (0,0),1; (0,1),2; (0,3),4; (1,1),4; (2,0),2; (2,3),3; (3,1),3; (3,2),2 ]
-
-    let sudoku4PairwiseWithGivens givens : Model<int> =
-        sudoku4WithGivens pairwiseNotEqual givens
-
-    /// Slice 3 — sparse 4x4 Sudoku through pairwise not-equal relations, plus one nonlocal
-    /// symmetry breaker. The five ordinary clues have two completions; excluding the lexicographically
-    /// first rectangle orientation makes the authored model unique without making arc consistency complete,
-    /// and makes the current value-order driver exercise a failed guess plus retract before succeeding.
-    let sudoku4Sparse () : Model<int> =
-        let model =
-            sudoku4PairwiseWithGivens
-                [ (0,3),4; (1,1),4; (2,0),2; (2,3),3; (3,2),2 ]
-        let at r c = List.item (r * 4 + c) model.cells
-        let excludeFirstRectangle =
-            Constraint.relation [ at 0 0; at 0 2; at 1 0; at 1 2 ] (fun values -> values <> [ 1; 3; 3; 1 ])
-        { model with constraints = model.constraints @ [ excludeFirstRectangle ] }
-
-    let dataflowOnFiniteGuard () : Model<int> =
-        let a = Cell.create "finite-a"
-        let b = Cell.create "finite-b"
-        { domain = Domain.finite [1; 2]
-          cells = [ a; b ]
-          constraints = [ Constraint.dataflow [ a; b ] id ]
-          givens = [] }
-
-    let relationOnLatticeGuard () : Model<Interval> =
-        let a = Cell.create "rich-a"
-        let b = Cell.create "rich-b"
-        let dom = Domain.lattice Interval.entire Interval.meet (fun iv -> iv = Empty)
-        { domain = dom
-          cells = [ a; b ]
-          constraints = [ Constraint.relation [ a; b ] (fun _ -> true) ]
-          givens = [] }
-
-    let wideDomainGuard () : Model<int> =
-        let c = Cell.create "wide-domain-cell"
-        { domain = Domain.finite [1..65]; cells = [ c ]; constraints = []; givens = [] }
-
-    let premiseWidthGuard () : Model<int> =
-        let cells = List.init 65 (fun i -> (Cell.create (sprintf "pwidth-%d" i) : Cell<int>))
-        { domain = Domain.finite [1; 2]; cells = cells; constraints = []; givens = [] }
-
-    let authoredOrderGuard () : Model<int> =
-        let cell = Cell.create "authored-order"
-        { domain = Domain.finite [2; 1]; cells = [ cell ]; constraints = []; givens = [] }
-
-
-// ---- Differential test oracles ------------------------------------------
-
-module private Harness =
-
-    /// Compute the portable finite GAC fixpoint before search. This stays in the harness so the
-    /// proof that a slice needs a guess does not add an observation field to the shipped net types.
-    let initialFixpoint (model: Model<'a> when 'a : comparison) : Map<Cell<'a>, 'a list> =
-        let values =
-            match model.domain with
-            | Finite values -> values
-            | Lattice _ -> invalidArg "model" "initialFixpoint requires a finite domain"
-        let givens = Map.ofList model.givens
-        let mutable candidates =
-            model.cells
-            |> List.map (fun cell -> cell, (Map.tryFind cell givens |> Option.map List.singleton |> Option.defaultValue values))
-            |> Map.ofList
-        let mutable changed = true
-        while changed do
-            changed <- false
-            for constraintBox in model.constraints do
-                match constraintBox with
-                | Relation box ->
-                    let before = box.cells |> List.map (fun cell -> Map.find cell candidates)
-                    let after = Gac.narrow box.allows before
-                    if after <> before then
-                        changed <- true
-                        for cell, narrowed in List.zip box.cells after do
-                            candidates <- Map.add cell narrowed candidates
-                | Dataflow _ ->
-                    invalidArg "model" "initialFixpoint requires portable finite relations"
-        candidates
-
-    /// Exhaustively enumerate assignments, pruning only when a fully assigned authored relation
-    /// rejects its tuple. This is deliberately independent of Gac.narrow and both lowering engines.
-    let bruteForceSolutions (model: Model<'a> when 'a : comparison) : Solution<'a> list =
-        let values =
-            match model.domain with
-            | Finite values -> values
-            | Lattice _ -> invalidArg "model" "bruteForceSolutions requires a finite domain"
-        let givens = Map.ofList model.givens
-        let relations =
-            model.constraints
-            |> List.map (function
-                | Relation box -> box
-                | Dataflow _ -> invalidArg "model" "bruteForceSolutions requires portable finite relations")
-        let relationAllows (assignment: Solution<'a>) (box: RelationBox<'a>) =
-            let assigned = box.cells |> List.map (fun cell -> Map.tryFind cell assignment)
-            if assigned |> List.forall Option.isSome then
-                assigned |> List.map Option.get |> box.allows
-            else true
-        let rec enumerate remaining (assignment: Solution<'a>) =
-            seq {
-                match remaining with
-                | [] -> yield assignment
-                | cell :: rest ->
-                    let choices = Map.tryFind cell givens |> Option.map List.singleton |> Option.defaultValue values
-                    for value in choices do
-                        let next = Map.add cell value assignment
-                        if relations |> List.forall (relationAllows next) then
-                            yield! enumerate rest next
-            }
-        enumerate model.cells Map.empty |> Seq.toList
-
-
-// ---- Run: the differential proof + the capability proof -----------------
-
-let private gridOf (model: Model<int>) (sol: Solution<int>) =
-    [ for r in 0 .. 3 -> [ for c in 0 .. 3 -> Map.find (List.item (r * 4 + c) model.cells) sol ] ]
-
-let private showGrid (label: string) (g: int list list) =
-    printfn "  %s" label
-    for row in g do printfn "     %A" row
-
-let private hasFiniteWidth needed width =
-    List.exists (function FiniteDomainTooWideForOptimized(n, w) when n = needed && w = width -> true | _ -> false)
-
-let private hasPremiseWidth needed width =
-    List.exists (function PremiseWidthExceeded(n, w) when n = needed && w = width -> true | _ -> false)
-
-let expected = [ [1;2;3;4]; [3;4;1;2]; [2;1;4;3]; [4;3;2;1] ]
-
-let main () =
-    printfn "runtime: %s" (System.Runtime.InteropServices.RuntimeInformation.FrameworkDescription)
-    printfn ""
-
-    printfn "== slice 2: 4x4 Sudoku through BOTH lowerings (Differential.solveBoth) =="
-    let sud = Slices.sudoku4 ()
-    let sudokuOk =
-        match Differential.solveBoth sud with
-        | Ok (Some fSol, Some oSol) ->
-            let fg, og = gridOf sud fSol, gridOf sud oSol
-            showGrid "general  (closure engine, FiniteRep.set):" fg
-            showGrid "optimized (array core, uint64 word):"  og
-            let agree = fSol = oSol
-            let correct = fg = expected && og = expected
-            printfn "  solveBoth agree: %b   both = known solution: %b" agree correct
-            agree && correct
-        | Ok _ -> printfn "  FAIL: a face returned no solution"; false
-        | Error es -> printfn "  FAIL: unexpected lowering error %A" es; false
-    printfn ""
-
-    printfn "== slice 3: sparse 4x4 forces DDB and has an independent uniqueness oracle =="
-    let sparse = Slices.sudoku4Sparse ()
-    let initial = Harness.initialFixpoint sparse
-    let openAfterPropagation = initial |> Map.toList |> List.filter (fun (_, values) -> List.length values > 1)
-    let noContradiction = initial |> Map.forall (fun _ values -> not (List.isEmpty values))
-    let searchRequired = noContradiction && not (List.isEmpty openAfterPropagation)
-    printfn "  initial GAC fixpoint: %d open cells; search required: %b" openAfterPropagation.Length searchRequired
-    let enumerated = Harness.bruteForceSolutions sparse
-    let uniquelySolvable = List.length enumerated = 1
-    printfn "  exhaustive authored-relation solutions: %d; unique: %b" enumerated.Length uniquelySolvable
-    let sparseDifferentialOk =
-        match Differential.solveBoth sparse, enumerated with
-        | Ok (Some generalSol, Some optimizedSol), [ oracleSol ] ->
-            let agree = generalSol = optimizedSol
-            let matchesOracle = generalSol = oracleSol && optimizedSol = oracleSol
-            printfn "  both faces solved: true; agree: %b; match unique oracle: %b" agree matchesOracle
-            searchRequired && agree && matchesOracle
-        | Ok (Some _, Some _), _ ->
-            printfn "  FAIL: both faces solved but the exhaustive oracle is not unique"
-            false
-        | Ok _, _ -> printfn "  FAIL: a face returned no sparse solution"; false
-        | Error es, _ -> printfn "  FAIL: unexpected sparse lowering error %A" es; false
-    printfn ""
-
-    printfn "== slice 1: C<->F is general-only (capability visible pre-engine) =="
-    let cf = Slices.celsiusFahrenheit ()
-    let optRejects =
-        match Optimized.lower cf with
-        | Error es -> printfn "  Optimized.lower rejects, naming why: %A" es; es = [ RichLatticeOnOptimized; DataflowOnOptimized ]
-        | Ok _ -> printfn "  FAIL: optimized accepted a general-only model"; false
-    let generalRuns =
-        match General.lower cf with
-        | Ok net ->
-            match General.solve net with
-            | Some sol ->
-                let show iv = match iv with Empty -> "BOT" | Iv(lo, hi) -> sprintf "[%.6g, %.6g]" lo hi
-                let read name = cf.cells |> List.tryFind (fun c -> c.name = name) |> Option.bind (fun c -> Map.tryFind c sol)
-                printfn "  General.solve: C = %s,  F = %s"
-                    (read "celsius"    |> Option.map show |> Option.defaultValue "-")
-                    (read "fahrenheit" |> Option.map show |> Option.defaultValue "-")
-                true
-            | None -> printfn "  FAIL: general C<->F produced no settled value"; false
-        | Error es -> printfn "  FAIL: general rejected C<->F %A" es; false
-    printfn ""
-
-    printfn "== generic General representation, guardrails, and one-word widths =="
-    let duplicateDomain =
-        try
-            Domain.finite [ 1; 1; 2 ] |> ignore
-            printfn "  FAIL: Domain.finite accepted duplicate values"
-            false
-        with :? System.ArgumentException ->
-            printfn "  Domain.finite rejects duplicate values at authoring time"
-            true
-    let listRep values : FiniteRep<int, int list> =
-        { top = values
-          ofValues = id
-          singleton = List.singleton
-          meet = fun left right -> left |> List.filter (fun value -> List.contains value right)
-          candidates = id
-          isBottom = List.isEmpty
-          isSingleton = fun state -> List.length state = 1
-          equals = (=) }
-    let genericGeneral =
-        match General.lowerWith listRep sud with
-        | Ok net ->
-            match General.solve net with
-            | Some solution ->
-                let correct = gridOf sud solution = expected
-                printfn "  General.lowerWith list representation solves correctly: %b" correct
-                correct
-            | None -> printfn "  FAIL: list representation produced no solution"; false
-        | Error es -> printfn "  FAIL: list representation lowering failed: %A" es; false
-
-    let authoredOrder = Slices.authoredOrderGuard ()
-    let authoredOrderPreserved =
-        match Differential.solveBoth authoredOrder with
-        | Ok (Some generalSolution, Some optimizedSolution) ->
-            let cell = List.head authoredOrder.cells
-            let generalValue = Map.find cell generalSolution
-            let optimizedValue = Map.find cell optimizedSolution
-            let preserved = generalValue = 2 && optimizedValue = 2
-            printfn "  authored finite-domain order preserved by both faces: %b" preserved
-            preserved
-        | Ok _ -> printfn "  FAIL: authored-order model produced no solution"; false
-        | Error es -> printfn "  FAIL: authored-order model failed to lower: %A" es; false
-
-    let dataflowFinite =
-        match General.lower (Slices.dataflowOnFiniteGuard ()) with
-        | Error es -> printfn "  General.lower finite+dataflow rejects: %A" es; es = [ DataflowRequiresRichLattice ]
-        | Ok _ -> printfn "  FAIL: general silently ignored finite-domain dataflow"; false
-    let relationLattice =
-        match General.lower (Slices.relationOnLatticeGuard ()) with
-        | Error es -> printfn "  General.lower lattice+relation rejects: %A" es; es = [ RelationRequiresFiniteDomain ]
-        | Ok _ -> printfn "  FAIL: general silently ignored rich-domain relation"; false
-
-    let wideDomain =
-        match Optimized.lower (Slices.wideDomainGuard ()) with
-        | Error es -> printfn "  Optimized.lower 65-value domain rejects: %A" es; hasFiniteWidth 65 64 es
-        | Ok _ -> printfn "  FAIL: optimized accepted a 65-value one-word domain"; false
-    let premiseWidth =
-        match Optimized.lower (Slices.premiseWidthGuard ()) with
-        | Error es -> printfn "  Optimized.lower 65-cell DDB bound rejects: %A" es; hasPremiseWidth 65 64 es
-        | Ok _ -> printfn "  FAIL: optimized accepted a >64 premise/search-depth bound"; false
-    let guardOk =
-        duplicateDomain && genericGeneral && authoredOrderPreserved && dataflowFinite && relationLattice && wideDomain && premiseWidth
-    printfn ""
-
-    let ok = sudokuOk && sparseDifferentialOk && optRejects && generalRuns && guardOk
-    printfn "RESULT: %s" (if ok then "PASS (two lowerings agree; DDB gate and capability witnesses correct)" else "FAIL")
-    if ok then 0 else 1
-
-exit (main ())

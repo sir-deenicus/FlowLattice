@@ -265,6 +265,11 @@ array core exists and agrees with the general one on Sudoku. The remaining defer
 `grid + tileset` preset. The array-core lowering proves the write-once discipline; the `Wfc` preset is the
 60fps specialization of it.
 
+**Update 2026-07-10:** item 4's "dress `module Wfc` inside the vocabulary + preset" phrasing is superseded
+by the second-gate boundary decision (§10): WFC is an *application layer* consuming the vocabulary from
+outside. The concrete next slice is the 2026-07-10 work order in §10 — `generate` + observation seam in the
+core, WFC authored in a new section of [propagator-wfc.fsx](../propagator-wfc.fsx) via `#load`.
+
 ## 10. Current suggestions
 
 **Codex suggestion, 2026-07-05.** Lock Fork C as the working discipline: one authored model, two lowerings.
@@ -515,6 +520,429 @@ append-only-history rule now guards the class. Minor, executor's discretion: the
 
 — Claude (Fable 5, Tier 0), 2026-07-10
 
+**Fable (Tier 0) work order, 2026-07-10 — third slice: `generate` + observation seam + the WFC
+application layer.** One pass, three deliverables, executed together. Locked rules are marked; everything
+else is executor's discretion — the executor is trusted to fill mechanism, so this names only the
+load-bearing structure and the places a reasonable implementation goes silently wrong.
+
+*Deliverable 1 — `generate` on both faces ([propagator-surface-vocab.fsx](../propagator-surface-vocab.fsx)).*
+
+- **Locked, the verb contract split:** `solve` stays exactly as it is — complete DDB, deterministic,
+  value order = authored order (the `[2;1]` row and the sparse slice are canaries; neither may change).
+  `generate` is the stochastic sampler: propagate to fixpoint → pick the open cell with fewest candidates
+  (ties by `model.cells` order) → draw a random candidate from the authored-order list → collapse →
+  repeat; on contradiction, restart the whole sample; loud failure past a bounded restart count. No
+  interleaving with DDB.
+- **Locked, the premise invariant:** `generate`'s collapses consume **no premises** — they are never
+  retracted individually; contradiction aborts the sample. Live premises during `generate` = givens only,
+  independent of grid size. This is what frees `generate` from the `givens + cells ≤ 64` bound while the
+  optimized face keeps one support word (fork B). Mechanism — a shared axiom premise, a premise-free
+  write, or rebuild-per-restart — is the executor's choice; the invariant is not.
+- **Locked, the preflight relocation:** `PremiseWidthExceeded` moves from `Optimized.lower` to
+  `Optimized.solve` (loud, pre-search). Lowering keeps only what lowering itself needs: domain ≤ 64
+  values, and givens ≤ 64 (lowering asserts givens under ids `0..`). Without this move a 250k-cell model
+  cannot even be lowered for `generate` — the bound is a *solve* capability, not a model capability. The
+  general face has nothing to move (int ids).
+- **Locked, RNG discipline:** the PRNG is an explicit pure implementation in core (e.g. SplitMix64),
+  seeded via a strategy parameter — not `System.Random` (the seed is part of the map artifact's contract;
+  reproducibility must not depend on runtime version). Draws are a function of visible state only
+  (authored-order candidate lists, `model.cells` order), never of rep internals. Consequence, and the
+  acceptance theorem: **same model + same seed ⇒ both faces generate the identical map** — the
+  differential harness extended to `generate`. Uniform draws for this slice; tile *weights* are a
+  deferred strategy extension, not built now.
+- Strategy record shape and the `generate` signature are executor's discretion (the stubs were never a
+  compatibility surface).
+
+*Deliverable 2 — `onCell` / `onNet` on both faces.* §12 already fixes the calling contract (synchronous,
+engine thread, mid-propagation, `IDisposable`, buffering is the outer wrapper's job). Two things it left
+open, now decided:
+
+- **Payload:** `CellChange<'a>` carries current candidates as `'a list` in authored order; `Resolved`
+  carries the value (as the DU already has it).
+- **Locked, the replay law:** folding the emitted event stream reproduces the net's final candidate
+  state — through search, backtrack, and restart (`Restored` fires on every widening). This is the whole
+  streaming-consumer contract: paint on `Resolved`, un-paint on `Restored`, never read the net. Event
+  volume under replay-all retraction is the general face's honest cost, not something to filter in core.
+- Both private engine copies will need an `OnChange` seam, which settles the gate-2 minor: the
+  "reproduced verbatim" headers are already false (`equals`, `Seal`) — either update the headers to name
+  every delta or upstream the deltas so the copies re-converge. Headers must stop lying either way.
+
+*Deliverable 3 — the WFC application layer ([propagator-wfc.fsx](../propagator-wfc.fsx), new literate
+section).*
+
+- **Locked, placement:** a new section of `propagator-wfc.fsx` — the WFC story file, where the
+  vocabulary-authored version sits next to the hand-built engine it retells — consuming the vocabulary
+  via `#load "propagator-surface-vocab.fsx"`. **Do not copy** the vocabulary or engines into the app
+  section; guarding the vocab file's harness against noisy `#load` is fine, forking it is not. The file
+  split is the ratified library-vs-application boundary made visible: grid topology, adjacency tables,
+  tileset — all here, nothing WFC-shaped in the vocab file.
+- Content: a small under-constrained tileset (≥3 tiles, e.g. sea/coast/land), a grid helper producing
+  cells + pairwise 4-neighbor `Constraint.relation` boxes, `generate` on the optimized face, streamed
+  through `onCell`.
+- **Locked, the oracles:** (a) post-hoc independent map check — every adjacent pair satisfies the
+  compatibility table and every cell is resolved, verified by walking the output grid with no engine
+  involved; (b) the cross-face seed test at small size (e.g. 8×8): same seed, both faces, identical
+  maps; (c) a replay check: the `onCell`/`onNet` stream folds to the final grid; (d) a
+  contradiction-capable tileset row that forces restarts and proves the bounded-restart loud failure.
+- Benchmarks: dated table in [benchmarks.md](benchmarks.md) (env block; correctness verified before
+  timing; fsi ⇒ trust ratios not absolutes): `generate` at 16×16 / 32×32 / 64×64, larger if fsi
+  tolerates. **Honest framing, locked:** this lowering (closure props, list-based `Gac.narrow` per edge)
+  is *not* the 60fps path — `module Wfc`'s structural store remains that; these numbers establish the
+  vocabulary's cost curve and inform whether an app-layer structural fast path is ever needed. Do not
+  optimize `Gac.narrow`'s per-edge enumeration inside the core to chase these numbers.
+
+*Attention list (subtle, not extra rules):* restart must re-assert givens (or rebuild the engine — then
+subscription disposal across rebuilds must not leak); `onCell` during search observes speculative
+narrowing, which is the honest contract; binary adjacency through `Gac.narrow` enumerates |dom|² tuples
+per edge per pass — acceptable at demo scale, an app-layer problem beyond it; Godot glue is out of scope,
+the app section proves the stream contract with a plain consumer; `solutions`, `assume`, `retract` stay
+stubbed — nothing in this slice forces them.
+
+*Acceptance:* every existing harness row passes unchanged; the new rows above pass; both surface scripts
+and `propagator-wfc.fsx` run clean under fsi; §11 history appended (append-only per AGENTS.md);
+benchmarks entry landed.
+
+— Claude (Fable 5, Tier 0), 2026-07-10
+
+**Codex suggestion, 2026-07-10 - canonical core and dependent friendly syntax.** Treat
+[propagator-surface-vocab.fsx](../propagator-surface-vocab.fsx) as the canonical load-safe core despite
+its provisional filename. Keep the library implementation in one place: vocabulary, the reusable
+dependency-free `Interval`, GAC, both private engines, and the `General` / `Optimized` faces. Move
+`Differential`, proof slices, fixtures, independent oracles, and the executable runner to
+[propagator-surface-vocab.tests.fsx](../propagator-surface-vocab.tests.fsx), which loads the core.
+
+[propagator-friendly.fsx](../propagator-friendly.fsx) is now a dependent authoring facade: it loads the
+same core, accumulates a `Model`, and invokes `General`; it owns no engine, finite representation, search
+driver, or duplicate core domain. Named friendly assumptions are removed from the authored model on
+`Retract`, and the next read rebuilds from the remaining model. Until the deferred core observation/read
+seam lands, a contradictory `General.solve` exposes only model-level `None`, so the facade cannot inspect
+an otherwise unaffected cell inside that contradictory net. Do not bypass that boundary by reaching into
+the private closure engine. `Interval` remains core and now overloads arithmetic between intervals and
+float constants, allowing ordinary expressions such as `interval * 9.0 / 5.0 + 32.0`.
+
+`propagator-mutable-core.fsx` remains a historical benchmark reproducer, not a library dependency or a
+fourth architectural layer. The intended active shape is three scripts: canonical core, its test harness,
+and friendly syntax over the core; eventual DLL packaging may replace the script loading without changing
+those ownership boundaries.
+
+**Codex superseding suggestion, 2026-07-10 - live General core and syntax-only friendly facade.** Reject
+the rebuild-on-read facade described in the preceding suggestion. It changed the original observable laws:
+one contradictory cell turned every friendly read into model-level failure, unaffected cells could no longer
+be inspected, named retraction rebuilt the model, provenance disappeared, and finite reads stopped returning
+the friendly Set shape. A process exit of zero did not make those behavioral regressions acceptable.
+
+Retain one live closure engine behind `GeneralNet`. The core now owns cell creation and constraint
+installation plus representation-independent `CellState` reads, support inspection, fresh premises,
+assert-under-premise, retraction, and finite DDB on that same state. `DataflowBox` distinguishes reads from
+outputs and permits `None` for "emit no contribution"; core `Constraint.convert` installs two directional
+source-only propagators, while core `Constraint.combine` owns fan-in readiness and support union. The
+existing total `Constraint.dataflow` constructor remains source-compatible by wrapping every result in
+`Some`. This is core propagator behavior, not friendly syntax.
+
+`propagator-friendly.fsx` must only adapt payloads, map user premise names to opaque core handles, expose
+methods and the `network { }` entry point, and delegate. Its helper is `PayloadAdapter`, not
+`FriendlyDomain`; it stores projection/injection functions and the already-created core net, but no model,
+constraint registry, lowering, cache, fallback rule, support calculation, or search driver. Friendly finite
+cells preserve the original Set-shaped assertion/read API atop core `FiniteRep`; scalar and interval cells
+preserve local contradiction, partial reads, named provenance, and live retraction. `ShowSupport` remains,
+with `Network.Support` supplying support from the opaque core cell handle.
+
+The three active scripts remain the canonical core, its test harness, and dependent friendly syntax.
+`propagator-mutable-core.fsx` remains historical benchmark evidence only. This recovery implements General
+`assume`/`retract` because friendly live editing requires them; Optimized editing and the streaming seams
+(`solutions`, `generate`, `onCell`, `onNet`) remain the next work order. The optimized array hot loop is
+unchanged. The 2026-07-10 same-process benchmark records Optimized at 14.30x the General face on the portable
+binary-relation Sudoku and a 44.2 us best live General two-assert/two-retract cycle; earlier benchmark rows
+remain unchanged and are not cross-run baselines for this different relation encoding.
+
+**Codex superseding suggestion, 2026-07-10 - enduring facade, test-only examples.** Keep exactly three
+active surface scripts. [propagator-surface-vocab.fsx](../propagator-surface-vocab.fsx) is the load-safe
+canonical core: vocabulary, engines and lowerings, generic relation/dataflow combinators, and enduring
+value helpers (`Scalar`, `Interval`, `Transform`, and `Transform.Affine`). Core `Gac` is private
+implementation machinery. [propagator-friendly.fsx](../propagator-friendly.fsx) is a silent, load-safe
+library facade containing only payload adaptation, named-premise translation, methods, computation-
+expression operations, and direct delegation to one live `GeneralNet`. Its generic `Constrain` operation
+accepts authored core constraints but supplies no domain policy of its own.
+
+Move every concrete scenario and executable check to
+[propagator-friendly.tests.fsx](../propagator-friendly.tests.fsx): differential proof slices, a test-local
+copy of GAC for the independent fixpoint harness, Celsius/Fahrenheit examples, barometer formulas and all
+four provenance stages, finite-Set verification, Sudoku givens/topology, renderers, expected results,
+benchmark runner, and `main`. `AllDifferent` is not an enduring core or friendly feature; Sudoku authors
+that reducible policy locally with `Constraint.relation`. This supersedes the preceding suggestions only
+where they promoted `AllDifferent`, exposed core GAC for a harness, kept examples executable in the facade,
+or placed reusable scalar/transform helpers outside the canonical core. Historical descriptions remain
+unchanged below.
+
+**Fable (Tier 0) audit, 2026-07-10 — the housekeeping consolidation (three Codex passes above): ACCEPTED,
+with two reversals referred to Deen for ratification.**
+
+*Verified independently.* The consolidated suite passes under fsi: both differential slices, the sparse DDB
+oracle (4 open cells, unique brute-forced solution, both faces agree), all capability/width guardrails, the
+authored-order canary, the barometer's four provenance stages bit-exact (√10 = 3.16228), raw-scalar
+`C = BOT` with `F` unaffected, and the new live-edit regression (cell-local contradiction, live restore).
+Both library scripts load silently, as claimed. The LIFO premise-reclaim discipline survived the rework on
+both faces (general: `nextPremise <- premise` after `Retract`; optimized: `gp <- p` unchanged). The
+optimized hot loop and its edit/streaming stubs are untouched. The third-slice work order is neither
+executed nor half-executed — the premise preflight correctly remains at lower-time until that slice moves
+it. The engine headers now say "copied and adapted" and name their deltas, settling the second gate's
+minor. Both benchmark entries follow the convention (correctness-gated, same-run ratios, cross-run
+non-comparability stated), and the optimized/general ratio is stable across the two runs (14.30× / 14.37×).
+
+*Process.* The append-only rule held under real pressure: the rejected rebuild-on-read facade is preserved
+verbatim and superseded in the open — an honest self-correction on the record rather than a squashed one,
+which is exactly the rule working. General `assume`/`retract` arriving ahead of the work order is accepted:
+friendly live retraction genuinely requires them, the justification is recorded, and the remaining seams
+are correctly left to the next slice.
+
+*Referred to Deen — two executor suggestions reverse his recorded ratifications, which a suggestion cannot
+do on its own:*
+
+1. **`AllDifferent` removed from the friendly surface.** §13 (ratified 2026-07-06) names
+   `net.AllDifferent grp` in the decided method list, and §5 calls `allDifferent` a write-once workhorse.
+   The removal's boundary instinct is right for the *core DU* (no policy cases in the vocabulary), but the
+   friendly face exists precisely for this ergonomics. Recommendation: restore it as **facade sugar** over
+   `Constraint.relation` — a few lines in `propagator-friendly.fsx`, no core case — satisfying both the
+   boundary and the ratified UX. Alternatively Deen ratifies the removal explicitly and §13 gets a
+   superseding entry.
+2. **`Transform`/`Affine` promoted into the canonical core file.** Reverses §13's "conversion helpers are
+   external / supplied, not core (Deen, 2026-07-06)". (`Scalar` and `Interval` in core are §12-consistent
+   and uncontested.) Low stakes either way; it is his call, not the executor's.
+
+Related: AGENTS.md's new core-membership rule hardcodes both contested examples as repo law. The principle
+is sound; the example list should track Deen's ruling on the two items above.
+
+*Minor.* The first 2026-07-10 benchmarks entry links to `propagator-surface-vocab.tests.fsx`, deleted the
+same day by the consolidation — fix by dated addendum noting the move into
+`propagator-friendly.tests.fsx`, not by editing the historical entry.
+
+— Claude (Fable 5, Tier 0), 2026-07-10
+
+**Deen ratification, 2026-07-10 — both referred items resolved, and the principle behind them named.**
+
+1. **`AllDifferent`: ratified out of core.** It was a testing-specific function; core membership was the
+   entire issue, and *outside* core its form is free — facade sugar may return someday if ergonomics
+   warrant it, but nothing is mandated. This supersedes §13's listing of `net.AllDifferent` among the
+   decided friendly methods (that listing stands as history; the method is no longer a required part of
+   the surface).
+2. **`Transform` / `Affine`: ratified in core.** They are helpers, but ergonomic and *general*. This
+   refines rather than reverses §13's "conversion helpers are external / supplied, not core": that
+   decision targeted helpers overfit to a specific demo or test, not general value algebras. `Scalar` and
+   `Interval` in core were already uncontested (§12).
+
+The principle, for future gates: **core membership is decided by durable architectural role, not by
+reference count or abstract genericity — general ergonomic algebras stay; fixture-shaped conveniences go
+to the test/demo split, whatever generic name they carry.** The named failure mode this fences: executors
+tend to be unhygienic about modularity and myopic about design, promoting whatever a current fixture
+needed into library surface. AGENTS.md's core-membership rule, including its example list, is hereby
+ratified as written.
+
+**Codex suggestion, 2026-07-10 - AsyncRx as a UX benchmark, not a module-count target.** AsyncRx is the
+stronger current user-facing UX because each public entry point has one canonical meaning: one
+`AsyncObservable` operator surface, one `AsyncRx` consume front door, standard CE syntax, and an explicit
+`EventChoice` authoring substrate. The comparison should measure semantic economy and coherence, not ask
+the propagator library to imitate AsyncRx's topology. AsyncRx transforms one homogeneous
+`AsyncObservable<'T>` type; a propagator library irreducibly has domains, typed cells, authored constraints,
+mutable network sessions, finite and lattice views, and General versus Optimized capabilities. Those are
+orthogonal concepts and deserve distinct homes when merging them would obscure their contracts.
+
+The governing test is: **duplication is evidence of something wrong; plurality is not.** Two names or
+paths expressing the same concept should trigger consolidation or a clear declaration of which is
+canonical and which is subordinate syntax. Separate modules or types are healthy when they encode
+orthogonal concepts. Merge only when it removes repeated meaning while preserving those distinctions;
+avoid a smaller surface bought by conflating concepts that users must still reason about.
+
+Applied to the present facade:
+
+- `Domain`, `Constraint`, and `Network` are distinct roles (describe values, author laws, run/edit a live
+  session), not proliferation. `General` and `Optimized` likewise expose different capability faces over
+  one authored model; compacting them together would erase useful boundaries.
+- `Network` methods and the same public operations repeated through `Ops` are genuine semantic duplication,
+  not orthogonality. Decide one canonical dialect. If the CE adapter remains, document and shape it as
+  subordinate syntax rather than a second peer vocabulary.
+- The finite facade currently collapses three concepts into `Set<'value>`: authored value, current
+  candidate view, and internal finite representation. That is a real coherence defect. Friendly finite
+  cells should be authored as `'value`, relations should consume `'value list`, and reads may return
+  `Set<'value>` without making Set the cell's authored type or the relation vocabulary.
+- The overloaded `Assert` name hides the orthogonal distinction between a permanent `Given` and a named,
+  retractable `Assume`; name those semantics directly. `Constrain` consuming an authored `Constraint` is a
+  valid noun/verb boundary, provided it does not expose representation-shaped values.
+- `Solve() : bool` followed by mutable `Value` reads underspecifies consumption compared with AsyncRx's
+  ordered run front doors. Revisit the result shape so success, failure, and the solved view are explicit,
+  while keeping the live edit session distinct from batch solving.
+
+This is the next friendly-UX review, not authorization to compress enduring concepts or to restore
+fixture-specific sugar. The target is the smallest surface that preserves the library's real conceptual
+axes and gives each surviving operation one clear home.
+
+**Fable (Tier 0) review, 2026-07-10 — the friendly-UX refinement proposal: ACCEPTED as the fourth-slice
+basis; the CE fork referred and resolved same day; two sharpenings locked.**
+
+The governing test — *duplication is evidence of something wrong; plurality is not* — is the companion of
+the core-membership principle, and the pair bracket executor myopia from both sides: core-membership stops
+executors promoting fixture needs into library surface; this one stops them compressing orthogonal concepts
+to win at surface-count optics. The proposal self-applies it honestly (it declines to imitate AsyncRx's
+one-type topology, and closes by forbidding itself fixture sugar). Accepted as-is: `Domain`/`Constraint`/
+`Network` and General/Optimized keep their distinct homes; `Given`/`Assume` get named at the method level —
+that lifts the names `Ops` already uses, and it is TMS-honest, since a Given is a premise the user holds no
+handle to, not a different mechanism. The same naming pass should decide how anonymous given-premises
+display in `ShowSupport` (today they print as bare `p3` — mysterious provenance in the same coherence class).
+
+**Referred and resolved — the CE stays, as an alternate language.** The proposal's "decide one canonical
+dialect; *if* the CE adapter remains…" quietly reopened Deen's 07-06 ratification of Option C (methods plus
+the `network { }` monad). Referred; Deen ruled same day: keep — and the ruling reframes it better than
+subordination. Methods and `Ops` + `network { }` are two *dialects* over one semantics — object-shaped and
+function-shaped F#, for users with different working styles — and the outward differentiation is strong
+enough that no user wonders whether two concepts exist. That satisfies the duplication test by its own
+declaration clause: duplication is two names for one concept *ambiguously*; a declared alternate language is
+plurality. The discipline that keeps it healthy is already as-built: `Ops` delegates to the methods, which
+delegate to `General.*`, so the semantics is authored exactly once and only syntax varies. Future
+consolidation passes may not merge or remove a dialect; this is now a ratified boundary.
+
+**Sharpening 1, locked for the fourth slice — the finite refit must not amputate partial information.** The
+tri-conflation diagnosis is the proposal's strongest item, and the target shape is right: authored type
+`'value`, relations over `'value list`, reads returning `Set<'value>` as the candidate *view*. But the
+current Set-payload `Assert` accidentally provides set-valued *restriction* — "this cell is one of
+{2, 3}" — which is genuine partial information, the propagator identity itself, not fixture sugar. The refit
+must either give restriction its own named verb (e.g. `Restrict`) or explicitly defer it in this doc; the
+one thing it may not do is drop the capability silently.
+
+**Sharpening 2, locked — the solved view is a snapshot, not a second surface.** Making success, failure,
+and the solved view explicit in the `Solve` result is right, but a "solved view" is exactly where an
+executor reaches for a second stateful handle — the rebuild-on-read facade caught and superseded above is
+the precedent. The solved view must be a pure snapshot read-out over the one live net; never a second live
+surface, never a rebuilt engine.
+
+Sequencing: this slice is facade-only; the third-slice work order above is core + application file. They
+are orthogonal and can execute in either order. The fourth-slice work order gets cut when Deen directs an
+executor at it.
+
+— Claude (Fable 5, Tier 0), 2026-07-10
+
+**Codex implementation status, 2026-07-10 - fourth friendly slice BUILT + verified.** The accepted UX
+refinement now ships in the load-safe facade. `Domain.finite` creates `Cell<'value>` directly through
+`General.createFinite`; relation predicates consume ordinary `'value list`, while `Value` exposes the live
+candidate view as `Set<'value>`. Exact permanent information is `Given`, exact named/retractable information
+is `Assume`, and partial information remains explicit through permanent and named/retractable `Restrict`
+overloads. Restrictions are translated by filtering the authored domain list, so the core retains authored
+candidate order even though observation is a mathematical Set.
+
+`Solve` now returns the existing `Solution<'state> option` snapshot from `General.solve` instead of a boolean
+followed by mutable reads. No solved wrapper, rebuilt model, second live handle, or facade propagation logic
+was introduced. Anonymous permanent support now displays as `given(<cell>)` or `restrict(<cell>)`; authored
+premise names remain unchanged. Methods and `Ops` + `network { }` remain equal alternate routes to the same
+delegated semantics. The function-shaped restriction names are `Ops.restrict` and `Ops.restrictNamed`, the
+minimal spelling needed because module functions do not have method overload syntax.
+
+The consolidated harness now proves value-shaped finite relations and givens, Set-shaped reads, both
+restriction lifetimes, assumption retraction, readable provenance, authored-order solve, snapshot-consuming
+Sudoku, and method/CE parity across reads, support, retraction, and solve. Silent core and facade loads and
+the complete correctness suite pass under .NET 9.0.12. Two complete same-process benchmark passes observed
+Optimized/General best-time ratios of 11.06x and 6.83x; the timed core path was unchanged, and the opposing
+movement of General and Optimized between runs was recorded as machine variability rather than attributed
+to this facade-only slice. No core engine, representation, search loop, or propagation hot loop changed.
+
+**Fable (Tier 0) gate, 2026-07-10 — fourth slice ACCEPTED; the benchmark spread diagnosed: Power saver
+plan, not the refit.**
+
+Read the rebuilt facade and independently re-ran the full suite: PASS, bit-exact fidelity through the new
+value/view API (barometer all four stages, raw-scalar `C = BOT`, both differential slices, live
+retraction). Both locked sharpenings honored, the first exceeded: `Restrict` ships in *both* lifetimes
+(anonymous-permanent displaying `restrict(<cell>)`, and named-retractable), translating by filtering the
+authored domain list so authored candidate order survives observation-as-`Set`; `Solve` returns the core's
+pre-existing `Solution<'state> option` — a plain `Map` snapshot, no second live handle, no rebuilt engine,
+no facade propagation. `Given`/`Assume` named as ruled; anonymous permanent support now displays
+`given(<cell>)`, closing the `p3`-provenance flag from the review. The CE ruling is honored: methods and
+`Ops` + `network { }` remain equal dialects, with `Ops.restrict`/`Ops.restrictNamed` added. The refit also
+went one honest step past the work item: friendly finite networks now run the core at `'state = 'value`
+directly (`General.createFinite values`, no `Set.singleton` wrapping), so relations consume plain values —
+the tri-conflation fix reaching the representation, not just the signatures. An explicit
+alternate-dialect bullet was added to AGENTS.md's new "Prefer Direct Designs" rule so a future
+consolidation pass reading only AGENTS.md cannot mistake the two dialects for repeated meaning.
+
+The benchmark spread is diagnosed, not just unattributed: the machine was found running the Windows
+**Power saver plan on AC**. During a third Tier-0 benchmark run the CPU sampled at 40–57% of base
+frequency throughout (i7-8750H at ~1.0–1.3 GHz effective vs 2.2 base) — and that throttled run still beat
+both recorded runs (General best 29,845.7 µs, Optimized best 3,016.7 µs, ratio 9.89×), bracketing five
+same-code runs at General 29.8k–49.5k / Optimized 2.8k–4.6k / ratio 6.83×–14.37×. Under a bouncing clock
+governor even same-process ratios move 2× because the two rows execute minutes apart. The executor's
+refusal to attribute the spread to the refit was correct; dated addendum in
+[benchmarks.md](benchmarks.md) records the diagnosis and extends the convention (record the active power
+plan in the env block; prefer a high-performance plan for recorded runs). The earlier standing minor —
+the dangling `propagator-surface-vocab.tests.fsx` link — was closed by the executor's own addendum.
+
+Fourth slice CLOSED. The board returns to one pending executor item: the third-slice work order above.
+
+— Claude (Fable 5, Tier 0), 2026-07-10
+
+**Codex work-order review, 2026-07-10 - the third-slice WFC order requires a recut before
+execution.** The Fable work order above remains preserved as the historical proposal, but it is no
+longer executable as written after Deen's clarification of the target. This entry records the issues;
+it does not authorize implementation or silently choose the replacement design.
+
+1. **The artifact and placement are wrong.** The existing
+   [propagator-wfc.fsx](../propagator-wfc.fsx) is historical implementation and timing evidence. It must
+   remain intact. The new WFC work belongs in a second file so old and new can be run in the same
+   environment and compared without erasing the path that produced the earlier numbers. This supersedes
+   the order's instruction to add a new literate section to the existing file.
+
+2. **The performance objective has changed materially.** The old order deliberately routes WFC through
+   closure-backed relation boxes and list-based `Gac.narrow`, explicitly calls that route "not the 60fps
+   path," and asks only for its cost curve. The clarified target is a highly optimized WFC implementation.
+   The current `Optimized` vocabulary face is a one-word finite-domain store with per-relation GAC; the
+   historical `Wfc.Engine` is a multiword, structural-neighbor store. Reaching the new target therefore
+   requires an explicit architectural decision: either an enduring, domain-independent optimized seam can
+   support the specialization, or the specialized machinery remains WFC-local behind the enduring friendly
+   UX. This may not be hidden as an incidental implementation detail.
+
+3. **Friendly UX is an acceptance criterion, not an optional wrapper.** Friendly means the library's good,
+   understandable user experience, and WFC is a stress test of its flexibility. The `network { }` syntax may
+   remain General-only, but a WFC author must not fall back to visible `Model` assembly, lowering selection,
+   representation conversion, engine wiring, or generic constraint plumbing. A WFC-local helper that merely
+   hides an awkward library boundary would conceal rather than solve a Friendly failure. The recut must first
+   determine how much of the enduring Friendly vocabulary naturally authors WFC, and add only the smallest
+   coherent general surface needed. It must not duplicate `Ops`, invent speculative backend interfaces, or
+   conflate the live General `Network` with backend-neutral model authoring just to make one example compile.
+
+4. **The core-machinery requirement must be discussed before it is added.** The current APIs cannot provide
+   the proposed generation and replay laws unaided. Candidate generic needs include premise-free collapse,
+   reset/restart to authored information, deterministic seeded choice, synchronous change notification, and
+   relocation of the optimized solve premise check. Any accepted domain-independent propagator mechanism may
+   live in core; tile sets, grids, adjacency, WFC entropy policy, WFC storage, and WFC optimization stay wholly
+   in the new file. The old order preselects several mechanisms before the new optimized and Friendly paths
+   have been settled, so those choices must be revalidated rather than implemented by inertia.
+
+5. **The observation contract has unresolved generality and replay holes.** `CellChange<'a>` describes
+   authored-order candidate lists, but General also supports scalar, interval, and arbitrary rich lattices,
+   where candidate-list and `Resolved` semantics are not defined. The replay law also lacks a declared initial
+   state: subscriptions are installed after lowering, so given-driven changes may already have occurred.
+   Restore-to-singleton transitions need an unambiguous rendering rule as well. The recut must either scope
+   finite observation honestly or define a representation that remains coherent for rich lattices, and it
+   must state the replay baseline without requiring consumers to inspect the live net.
+
+6. **Several acceptance statements conflict with current code or with each other.** Moving
+   `PremiseWidthExceeded` from `Optimized.lower` to `Optimized.solve` necessarily changes the existing
+   65-cell guard row, despite the old acceptance line saying every row passes unchanged. The new law should
+   prove that such a model lowers and can generate, while deterministic DDB solve fails loudly before search.
+   The attention note that `assume` and `retract` remain stubbed is already stale for General. The old
+   `generate : Solution seq` stub is explicitly non-binding, but the work order does not decide whether one
+   seeded map or a stateful lazy stream is the actual UX; the simpler one-map contract should be preferred
+   unless repeated generation demonstrates a need. These are work-order corrections, not implementation
+   discretion to resolve silently.
+
+7. **The benchmark acceptance is now incomplete.** The new file must run correctness before timing and obey
+   the repository's same-run, relative-comparison rule on this variable machine. Its rows should compare the
+   preserved historical WFC implementation and the new implementation together at matching sizes, report
+   ratios and scenario context, and record the active power plan. A table that times only the vocabulary GAC
+   route would answer the superseded question.
+
+The enduring laws remain: `solve` stays deterministic in authored value order; alternative authoring and
+execution routes must express the same WFC semantics rather than become unrelated examples; seeded behavior
+must be reproducible from visible authored state; no WFC-shaped policy enters propagator core; the old WFC
+file and dated history remain untouched. A replacement work order should be cut only after the Friendly
+authoring shape, high-performance backend path, smallest generic core seams, replay contract, and comparative
+benchmark plan have been agreed.
+
 ## 11. Dated history
 
 - **2026-07-05 - Codex.** Added the current suggestion above: provisionally accept write-once authoring,
@@ -624,6 +1052,121 @@ append-only-history rule now guards the class. Minor, executor's discretion: the
   library-vs-application line are distinct axes). A history-rewrite incident (dated entries edited in
   place to match the new boundary) was caught, restored verbatim, and fenced by the repo AGENTS.md
   append-only rule. Independently re-verified: both scripts pass under fsi.
+- **2026-07-10 - Fable (Tier 0) work order (third slice).** Ordered `generate` + the observation seam +
+  the WFC application layer as one executor pass (§10). Locked: the `solve`/`generate` contract split
+  (complete-deterministic vs seeded-stochastic-restart); `generate` consumes no premises (live premises =
+  givens only, at any grid size — fork B honored); `PremiseWidthExceeded` relocates from lower-time to
+  `solve`-time; explicit pure PRNG with the cross-face theorem *same seed ⇒ identical map* as the new
+  differential row; the `CellChange` payload (authored-order `'a list`) and the event replay law; the app
+  layer lives in `propagator-wfc.fsx` via `#load`, never by copying the vocabulary; oracles = engine-free
+  map check, cross-face seed test, replay fold, bounded-restart failure; benchmarks entry with the honest
+  "not the 60fps path" framing. `solutions`/`assume`/`retract` stay stubbed.
+
+- **2026-07-10 - Codex (core/friendly source consolidation).** Made
+  [propagator-surface-vocab.fsx](../propagator-surface-vocab.fsx) the load-safe canonical core. Extracted
+  `Differential`, proof slices, fixtures, independent oracles, and `main` into the new
+  [propagator-surface-vocab.tests.fsx](../propagator-surface-vocab.tests.fsx). Replaced the standalone
+  friendly implementation with a facade that `#load`s the core, authors the same `Model`, and lowers
+  through `General`; no engine, `FiniteRep`, core `Domain`, or search implementation is copied there.
+  Retained `Interval` in core, added interval/float arithmetic overloads plus square-root support, and
+  rewrote the C/F examples with ordinary operator syntax. `propagator-mutable-core.fsx` is now explicitly
+  only historical benchmark evidence. Verified the core directly, the extracted differential harness,
+  and the dependent friendly examples under `dotnet fsi`; recorded that partial cell reads from a
+  contradictory friendly model await the deferred core observation/read seam.
+
+- **2026-07-10 - Codex (live-core recovery; supersedes the rebuilding facade).** Preserved the preceding
+  consolidation entry verbatim but rejected its rebuild-on-read implementation after behavioral testing
+  exposed model-level contradiction, lost partial reads/provenance, simulated retraction, and a changed
+  finite API. Extended the canonical core so `GeneralNet` retains its closure engine and delegates live
+  `CellState`/support reads, premise assertion, retraction, and finite search. Added optional directional
+  dataflow outputs plus core `convert`/`combine`/`allDifferent` mechanics. Rewrote friendly as only
+  `PayloadAdapter`, premise-name mapping, methods, CE operations, and direct General calls; restored
+  Set-shaped finite cells, raw scalar `C=BOT` with unaffected `F=33.8`, all four barometer/provenance stages,
+  named retraction, interval behavior, and Sudoku. Added a core regression for cell-local contradiction
+  and live restore. Verified all three scripts under FSI. Appended a correctness-gated same-process benchmark
+  (Optimized 14.30x General on the timed portable row; General live edit cycle 44.2 us best) without altering
+  any prior benchmark entry. Optimized propagation remained unchanged; streaming and Optimized edit seams
+  remain the next work order.
+
+- **2026-07-10 - Codex (enduring facade/test split).** Made
+  [propagator-friendly.fsx](../propagator-friendly.fsx) a silent, load-safe library facade and moved all
+  executable examples, fixtures, renderers, regressions, differential checks, and benchmark entry point to
+  [propagator-friendly.tests.fsx](../propagator-friendly.tests.fsx). Removed `AllDifferent` from
+  `Constraint`, `General`, friendly `Network`, and `Ops`; the Sudoku test now supplies its all-different
+  policy locally through generic `Constraint.relation` and the facade's thin `Constrain` delegation. Made
+  core `Gac` private and gave the independent fixpoint harness a test-local copy. Moved the enduring
+  `Scalar`, scalar meet, `Transform`, and `Affine` helpers into the canonical core alongside `Interval`.
+  Verified silent direct loads of core and friendly, the consolidated correctness suite, and opt-in
+  benchmark mode under `dotnet fsi`; neither propagation hot loop changed, and earlier benchmark history
+  was left untouched.
+- **2026-07-10 - Fable (Tier 0) housekeeping audit.** Accepted the three-pass consolidation (§10):
+  independently re-ran the full suite (PASS, fidelity bit-exact incl. barometer and raw-scalar `C=BOT`),
+  verified silent loads, LIFO reclaim on both faces, the untouched optimized hot loop, the unviolated
+  third-slice work order (preflight still lower-time by design), honest engine headers, and
+  convention-compliant benchmarks (stable 14.3× ratio). Praised the in-the-open supersession of the
+  rebuild-on-read facade as the append-only rule working. Referred TWO executor reversals of ratified §13
+  decisions to Deen: the `AllDifferent` removal from the friendly surface (recommend restoring as facade
+  sugar over `Constraint.relation`) and `Transform`/`Affine` moving into core; AGENTS.md's example list
+  should track his ruling. Minor: dangling benchmarks link to the consolidated-away
+  `propagator-surface-vocab.tests.fsx` — fix by dated addendum.
+- **2026-07-10 - Deen ratification (core-membership principle).** Resolved both items the audit referred:
+  `AllDifferent` stays out of core (it was testing-specific; outside core its form is free — no facade
+  sugar mandated), superseding §13's method listing; `Transform`/`Affine` stay in core (ergonomic and
+  general), refining §13's "external/supplied" call, which targeted demo-overfit helpers only. Principle
+  named: core membership = durable architectural role, not reference count or abstract genericity —
+  fencing the executor tendency to be unhygienic about modularity and myopic about design. AGENTS.md's
+  core-membership rule and example list ratified as written.
+- **2026-07-10 - Codex + Deen (AsyncRx UX comparison).** Compared the friendly propagator facade with the
+  repository's AsyncRx user idiom and recorded AsyncRx as a benchmark for semantic economy and coherence,
+  not a mandate to copy its compact module topology. Deen sharpened the criterion: duplication signals a
+  design problem, while separate homes are correct for orthogonal concepts; never merge merely to reduce
+  visible surface when doing so conflates concepts. Applied that test to preserve the distinct
+  `Domain`/`Constraint`/`Network` and General/Optimized roles while flagging method/`Ops` duplication, the
+  finite facade's authored-value/candidate-view/Set-representation conflation, overloaded `Assert`
+  semantics, and the weak boolean `Solve` result as the next UX questions.
+- **2026-07-10 - Fable (Tier 0) + Deen (UX refinement reviewed; CE ruled).** Accepted the refinement
+  proposal as the fourth-slice basis (§10); recorded the duplication-vs-plurality test as the companion of
+  the core-membership principle (each fences one direction of executor myopia). The method/`Ops`+CE fork was
+  caught as a quiet reopening of the 07-06 Option C ratification and referred; Deen ruled: the CE and `Ops`
+  stay as a declared *alternate language* — a function-shaped dialect over the same once-authored semantics,
+  strongly differentiated outward — plurality, not duplication, and not removable by consolidation passes.
+  Two sharpenings locked for the eventual fourth slice: the finite refit must keep set-valued restriction
+  (own verb or explicit deferral, never silent loss), and the explicit `Solve` result's solved view must be
+  a pure snapshot of the one live net (rebuild-on-read precedent). Orthogonal to the third slice; either
+  execution order works.
+
+- **2026-07-10 - Codex (fourth friendly slice implemented + verified).** Refit the facade adapter to
+  separate exact payload from observed view; finite cells and relations now use ordinary authored values,
+  reads remain `Set<'value>`, and authored-order filtering preserves deterministic search. Replaced the two
+  ambiguous `Assert` overloads with `Given`, `Assume`, and permanent/named `Restrict`; added readable
+  permanent provenance; and made `Solve` return the core `Solution option` snapshot directly. Preserved
+  methods and `Ops`/CE as equal delegated dialects and added parity coverage. Silent loads, the complete
+  correctness suite, and two full benchmark passes succeeded; the benchmark ratios varied from 11.06x to
+  6.83x with no timed core code changed, so both runs were recorded as environmental evidence. No core
+  engine or hot loop changed.
+- **2026-07-10 - Fable (Tier 0) gate (fourth slice CLOSED; benchmark spread diagnosed).** Accepted the
+  fourth slice (§10): independent full-suite re-run PASS bit-exact; both locked sharpenings honored
+  (`Restrict` in both lifetimes with authored-order filtering; `Solve` = the core's pre-existing `Map`
+  snapshot, no second handle); CE ruling honored (methods and `Ops`/CE equal dialects, `restrict`
+  spellings added); `given(<cell>)`/`restrict(<cell>)` provenance closes the `p3` flag; the finite refit
+  reached representation depth (`'state = 'value`, no `Set.singleton` wrapping). Added the explicit
+  alternate-dialect bullet to AGENTS.md's "Prefer Direct Designs". Benchmark spread *diagnosed*: the
+  machine was on the Windows Power saver plan on AC — CPU sampled at 40–57% of base frequency during a
+  third Tier-0 run that still beat both recorded runs (ratio 9.89×; day's bracket 6.83×–14.37× on
+  identical timed code) — clock-governor variance, not the refit; benchmarks.md addendum extends the
+  convention (record power plan; prefer high-performance for recorded runs). The dangling tests-link
+  minor was closed by the executor's addendum. Board: third-slice work order remains the one pending item.
+
+- **2026-07-10 - Codex + Deen (WFC work order reopened before execution).** Deen clarified that Friendly
+  is the library's UX standard and WFC is its flexibility test: `network { }` may remain General-only, but
+  WFC may not expose model/lowering/representation/constraint plumbing. The historical
+  `propagator-wfc.fsx` is now preserved unchanged for implementation history and same-run timing comparison;
+  new work belongs in a second WFC-only file whose goals are high optimization, no visible constraint
+  plumbing, and clear approachable authoring. Codex reviewed the pending third-slice order and found it
+  requires a recut before execution: its in-place file instruction and deliberately non-60fps GAC cost-curve
+  target are superseded; generic collapse/reset/observation needs require discussion; finite event payload,
+  replay baseline, premise-width test relocation, stale stub notes, generation result shape, and comparative
+  benchmark acceptance remain unresolved. No implementation was authorized by the review.
 
 ## 12. The dependency boundary and the observation split
 

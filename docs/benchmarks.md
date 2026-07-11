@@ -148,6 +148,43 @@ Same-process anchor rows from this run:
 
 **Reading.** The locality win shows up on the authored-edit case item 5 was built for: a one-column gravity cone beats full replay by **1.68×** even in fsi optimize-off, with only one surviving pin to replay. The large dense ramp case is the honest degenerate: cone-local must reset and re-fire a huge dense-domain frontier, so full replay of the surviving opposite-corner pin is faster in this harness. That is acceptable for the design: the interactive-edit payoff is small cones, while large cones collapse back toward replay-scale cost.
 
+---
+
+## 2026-07-10 - canonical surface core: General live edits and Optimized lowering
+
+- **Source:** [propagator-surface-vocab.fsx](../propagator-surface-vocab.fsx), timed by the opt-in
+  `--benchmark` mode in [propagator-surface-vocab.tests.fsx](../propagator-surface-vocab.tests.fsx).
+- **Scenario:** the same 4x4 Sudoku and eight givens as the proof slice, encoded as portable binary
+  not-equal relations. Full-solve rows include lowering/build, asserting givens, propagation, and solve
+  from scratch. The live-edit row reuses one rich-lattice General net and times two assertions (the
+  second contradictory) plus both retractions back to top; network construction is outside that row.
+- **Runtime:** .NET 9.0.12, `dotnet fsi`, optimizations **OFF** (fsi default).
+- **Machine:** Intel Core i7-8750H (Coffee Lake); current power/throttle state was not independently
+  measured, so same-process ratios remain the signal.
+- **Harness:** full solves = best-of-3 trials x 5 iterations, 3 warmups; live edit = best-of-5 x 500,
+  100 warmups; `GC.Collect` plus pending-finalizer wait between trials; all rows in one process.
+- **Correctness:** before timing, both lowerings returned the same known Sudoku solution. The live row
+  separately proved that contradiction remained cell-local, support stayed attached to the unaffected
+  derived cell, and retract restored both cells to top on the same engine.
+- **Commit:** `c5d8c9d` + working-tree surface recovery.
+
+| row | best us/run | mean us/run | same-process comparison |
+|-----|------------:|------------:|------------------------:|
+| General lower + solve | 49,468.5 | 60,973.5 | 1.00x |
+| **Optimized lower + solve** | **3,459.5** | **4,485.1** | **14.30x faster** |
+| General live 2-assert + 2-retract cycle | 44.2 | 52.8 | edit-only row |
+
+**Reading.** The canonical Optimized face remains mechanically isolated from General: live read/edit
+closures were added only to `GeneralNet`, with no dispatch or allocation added to `ArrayCore`'s emit or
+quiesce loops. In this portable binary-relation workload it is 14.30x faster than the closure/Set face
+in the same process. The 44.2 us live row confirms the friendly path now edits one retained engine rather
+than rebuilding a model for each read or retraction.
+
+Do not compare these absolute full-solve numbers to the 2026-06-24 table: that run used naked/hidden-single
+propagators and different sampling, while this row lowers generic binary relations through `Gac.narrow`.
+The valid claims here are the in-run General/Optimized ratio and the new live-edit anchor. Earlier timing
+entries remain unchanged historical evidence.
+
 <!-- Template for the next run — copy the section above, update the env block, add rows.
 ## YYYY-MM-DD — <what changed>
 - **Source:** …
@@ -159,3 +196,101 @@ Same-process anchor rows from this run:
 
 | representation | best µs/solve | mean µs/solve | vs baseline |
 -->
+
+---
+
+## 2026-07-10 - enduring-facade split, complete surface suite
+
+- **Source:** [propagator-surface-vocab.fsx](../propagator-surface-vocab.fsx), exercised by the
+  consolidated [propagator-friendly.tests.fsx](../propagator-friendly.tests.fsx) `--benchmark` mode.
+- **Scenario:** the complete current surface suite ran first: friendly scalar/affine/interval behavior,
+  all four barometer provenance stages, finite-Set retraction, friendly Sudoku, both differential Sudoku
+  slices, capability/width guards, authored-order agreement, and live General edit correctness. Timing then
+  covered the same portable binary-relation 4x4 Sudoku on General and Optimized plus the retained General
+  two-assert/two-retract live-edit cycle.
+- **Runtime:** .NET 9.0.12, `dotnet fsi`, optimizations **OFF** (fsi default).
+- **Machine:** Intel Core i7-8750H (Coffee Lake). Sustained benchmark timings on this machine are highly
+  variable and trend slower as a run continues, so the meaningful result is the complete-suite,
+  same-process relative comparison. Absolute values are environmental observations, not cross-run
+  regression evidence.
+- **Harness:** full solves = best-of-3 trials x 5 iterations, 3 warmups; live edit = best-of-5 x 500,
+  100 warmups; `GC.Collect` plus pending-finalizer wait between trials. Benchmark order was General,
+  Optimized, then live edit.
+- **Correctness:** every pre-timing regression and differential oracle passed; both lowering faces returned
+  the same known Sudoku solution. Neither propagation hot loop changed in the facade/test split.
+- **Commit:** `c5d8c9d` + working-tree enduring-facade/test split.
+
+| row | best us/run | mean us/run | same-process comparison |
+|-----|------------:|------------:|------------------------:|
+| General lower + solve | 39,897.7 | 112,256.3 | 1.00x full-solve baseline |
+| **Optimized lower + solve** | **2,777.3** | **3,061.8** | **14.37x faster by best** |
+| General live 2-assert + 2-retract cycle | 30.7 | 46.6 | edit-only anchor; different workload |
+
+**Reading.** The valid full-solve claim is within this run: Optimized completed the identical authored
+model 14.37x faster than General by best time. The large General best/mean spread is consistent with the
+machine's known sustained-run variability and is why these absolutes must not be compared directly with
+the earlier section. The live-edit row remains useful only as a same-run edit-cost anchor; it is not a
+full-solve speedup comparison.
+
+---
+
+## 2026-07-10 addendum - consolidated benchmark harness
+
+The first 2026-07-10 entry above names `propagator-surface-vocab.tests.fsx`, the harness that produced
+those recorded numbers. Later that day its executable tests and benchmark mode moved into the consolidated
+[propagator-friendly.tests.fsx](../propagator-friendly.tests.fsx), and the original test file was removed.
+This addendum supplies the current runnable link without rewriting the historical source entry; it does not
+change that entry's measurements or interpretation.
+
+---
+
+## 2026-07-10 - fourth-slice friendly UX refit
+
+- **Source:** [propagator-friendly.tests.fsx](../propagator-friendly.tests.fsx), run twice in its opt-in
+  `--benchmark` mode after the friendly value/view API refit.
+- **Scenario:** the complete correctness suite ran before each timing block. Timed rows remained the same
+  portable binary-relation 4x4 Sudoku on General then Optimized, followed by the retained General live-edit
+  cycle. The facade refit itself is outside these timed core paths.
+- **Runtime:** .NET 9.0.12, `dotnet fsi`, optimizations **OFF** (fsi default).
+- **Machine:** Intel Core i7-8750H (Coffee Lake), with no controlled power or throttle state.
+- **Harness:** each complete process used three warmups then best/mean of 3 trials x 5 iterations for full
+  solves, followed by 100 warmups and 5 trials x 500 iterations for live edit. Order remained General,
+  Optimized, live edit.
+- **Correctness:** both runs passed every facade, provenance, finite, differential, authored-order,
+  capability, width, and live-retraction regression before timing. No core engine, representation, search
+  loop, or propagation hot loop changed in this slice.
+- **Commit:** `c5d8c9d` + working-tree fourth-slice facade refit.
+
+| run | row | best us/run | mean us/run | same-process comparison |
+|-----|-----|------------:|------------:|------------------------:|
+| 1 | General lower + solve | 43,613.1 | 48,089.3 | 1.00x full-solve baseline |
+| 1 | **Optimized lower + solve** | **3,942.7** | **4,249.8** | **11.06x faster by best** |
+| 1 | General live 2-assert + 2-retract cycle | 43.0 | 52.8 | edit-only anchor |
+| 2 | General lower + solve | 31,608.1 | 37,139.0 | 1.00x full-solve baseline |
+| 2 | **Optimized lower + solve** | **4,627.1** | **5,801.9** | **6.83x faster by best** |
+| 2 | General live 2-assert + 2-retract cycle | 40.0 | 51.8 | edit-only anchor |
+
+**Reading.** Optimized remained faster than General within both complete same-process runs, but the ratio
+did not reproduce the earlier 14.30x/14.37x observations. Between these two immediate runs General became
+faster while Optimized became slower, demonstrating substantial ratio as well as absolute-time variability
+on this machine. Because the fourth slice changed only the facade and tests, not either timed lowering or
+engine loop, these measurements are recorded without attributing the spread to the UX refit.
+
+## 2026-07-10 addendum - the fourth-slice spread explained: Power saver plan (Tier-0 verification)
+
+Independent verification of the entry above found the machine running the Windows **"Power saver" power
+plan while on AC** (97% charge). During a third benchmark run on the identical working tree, the
+`\Processor Information(_Total)\% Processor Performance` counter sampled at **40-57% of base frequency**
+throughout (i7-8750H, 2.2 GHz base / 4.1 GHz turbo; `Win32_Processor.CurrentClockSpeed` read 1,400 MHz) —
+the CPU never reached even base clock. That throttled third run nonetheless produced *faster* absolutes
+than both recorded runs: General lower+solve best 29,845.7 us, Optimized best 3,016.7 us, live edit best
+27.5 us, ratio 9.89x. The day's five same-code runs now bracket as General best 29.8k-49.5k us, Optimized
+best 2.8k-4.6k us, ratio 6.83x-14.37x.
+
+Conclusion: the spread — including the depressed and unstable ratios — is clock-governor variance under an
+uncontrolled throttled power plan, not the facade refit (whose timed core path is unchanged, and which this
+run re-verified correct before timing). Note the same-run ratio is *not* immune here: the General and
+Optimized rows execute minutes apart within one process, each at whatever frequency the governor happens to
+hold, so under Power saver even within-run ratios move by 2x. Convention extension for future entries:
+record the active power plan (`powercfg /getactivescheme`) in the environment block, and prefer a
+high-performance plan on AC for recorded runs.
