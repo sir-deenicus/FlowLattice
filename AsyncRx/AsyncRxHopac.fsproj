@@ -1,0 +1,20 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <AssemblyName>AsyncRxHopac</AssemblyName>
+    <RootNamespace>AsyncRxHopac</RootNamespace>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Include="Core.fs" />
+    <Compile Include="EventChoice.fs" />
+    <Compile Include="Internal.fs" />
+    <Compile Include="AsyncRx.fs" />
+    <Compile Include="AsyncObservable.fs" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Hopac" Version="0.5.1" />
+    <PackageReference Include="FSharp.Control.AsyncSeq" Version="4.15.0" />
+  </ItemGroup>
+</Project>

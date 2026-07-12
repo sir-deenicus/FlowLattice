@@ -1,4 +1,4 @@
-#load "AsyncRxHopac.fsx"
+#r "../bin/Debug/net8.0/AsyncRxHopac.dll"
 
 open Hopac
 open AsyncRxHopac                  // module prefixes (AsyncObservable, AsyncRx) + the asyncRx/clauses CE values
