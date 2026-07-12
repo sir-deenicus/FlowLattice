@@ -22,6 +22,19 @@
 - Orientation and a concise statement of readiness are allowed, but do not run implementation commands,
   edit files, execute tests, or otherwise advance the work before that confirmation.
 
+## Write Commit Messages for Future Readers
+
+- A commit message must let a reader understand the meaningful change and the relevant design choice
+  without reopening the diff or reconstructing the author's reasoning.
+- The subject names the outcome, not the file operation. Add a short body when it is needed to explain
+  what changed and why that shape was chosen.
+- Be concrete rather than vague: name the important structure or behavior introduced, preserved, or
+  changed.
+- Let length follow missing context. Use the shortest message that makes the intent clear; do not force
+  a one-line summary when a few brief body lines are necessary, and do not turn the message into a
+  diff narration or mini-specification.
+- Keep the subject scannable (roughly 50–72 characters) and wrap body lines around 72 characters.
+
 ## Treat Understanding Questions as Confirmation Gates
 
 - Any prompt asking whether you understand, follow, see the principle, or can explain the task is a

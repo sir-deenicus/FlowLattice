@@ -3,3 +3,5 @@ changes.txt
 .fake
 AsyncRx/bin/*
 AsyncRx/obj/*
+AsyncRx/**/bin/*
+AsyncRx/**/obj/*

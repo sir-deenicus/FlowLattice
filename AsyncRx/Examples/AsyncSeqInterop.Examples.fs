@@ -1,5 +1,7 @@
+module AsyncSeqInteropExamples
+
 (*
-    AsyncSeqInterop.Examples.fsx
+    AsyncSeqInterop.Examples.fs
 
     A small demo of two paradigm-native systems coupled into one feedback loop,
     each a genuine driver, talking through the AsyncRx <-> AsyncSeq bridge:
@@ -27,10 +29,9 @@
     their own clocks, through merge's single serialized channel); and a clean
     cross-link shutdown.
 
-    Run:  dotnet fsi AsyncSeqInterop.Examples.fsx
+    Run:  dotnet run --project AsyncRx/Tests/AsyncSeqInterop.Examples/AsyncSeqInterop.Examples.fsproj
 *)
 
-#r "../bin/Debug/net8.0/AsyncRxHopac.dll"
 
 open FSharp.Control
 open AsyncRxHopac                  // module prefixes for qualified calls: AsyncObservable, AsyncRx
@@ -123,6 +124,3 @@ let thermostatDemo () =
 
     printfn ""
     printfn "=== demo complete ==="
-
-thermostatDemo ()
-

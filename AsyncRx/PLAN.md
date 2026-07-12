@@ -1,6 +1,6 @@
 # AsyncRx Library Conversion Plan
 
-Status: stages 1–4 completed — the compiled library preserves the current
+Status: stages 1 through 5 completed - the compiled library preserves the current
 `AsyncRxHopac.fsx` design, and copied compatibility checks pass against it.
 
 ## Locked starting point
@@ -108,3 +108,10 @@ the current lightweight harness.
 
 Success condition: validation is runnable through normal project commands and
 continues to exercise the same behavioral contracts.
+
+The consolidated validation projects are runnable with `dotnet run --project`:
+
+- `AsyncRx/Tests/AsyncRxHopac.Tests.fsproj`
+- `AsyncRx/Examples/AsyncRxHopac.Examples.fsproj`
+
+**Completed 2026-07-12.**

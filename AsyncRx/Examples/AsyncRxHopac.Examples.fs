@@ -1,4 +1,5 @@
-#r "../bin/Debug/net8.0/AsyncRxHopac.dll"
+module AsyncRxHopacExamples
+
 
 open Hopac
 open AsyncRxHopac                  // module prefixes (AsyncObservable, AsyncRx) + the asyncRx/clauses CE values
@@ -166,21 +167,3 @@ let patternLikeDemo () =
         }
 
     AsyncRx.runBlocking result (printfn "%s")
-
-printfn "== productMergeDemo =="
-productMergeDemo ()
-
-printfn "\n== asyncRxBuilderDemo =="
-asyncRxBuilderDemo ()
-
-printfn "\n== branchChoiceDemo =="
-branchChoiceDemo ()
-
-printfn "\n== patternLikeDemo =="
-patternLikeDemo ()
-
-printfn "\n== backpressureAndCancellationDemo =="
-backpressureAndCancellationDemo ()
-
-printfn "\n== backpressureAndCancellationDemoWithAsyncRxHelpers =="
-backpressureAndCancellationDemoWithAsyncRxHelpers ()
