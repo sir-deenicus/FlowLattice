@@ -587,3 +587,91 @@ with exact fingerprints `632233C0779601913FB945173CCFDD1861FA5769185DD4114BE0FA4
 measured General Sudoku 38,748.9 / 41,028.5 us, Optimized Sudoku 994.7 / 1,028.7 us, and General live edit
 31.9 / 37.0 us, preserving a 38.95x same-run Sudoku ratio. These controls put the final ramp rows near the
 strongest earlier WFC checkpoint rather than the late 12-second drift sample.
+
+## 2026-07-13 addendum - bounded General closure and structural provenance
+
+The bounded/provenance pass was based on commit
+`a2a36e73974492f26d33454487cb100f1ef2a0e4` and changed only the canonical General closure path plus focused
+tests. Optimized/WFC propagation was not modified. All values below are best / mean microseconds under
+.NET 9.0.12. Each `propagator-friendly.tests.fsx --benchmark` process ran the complete correctness gate and
+then preserved the established order: General Sudoku, Optimized identical Sudoku, General live edit. The
+new two-hop rows followed those controls in the final processes.
+
+| checkpoint | General Sudoku | Optimized Sudoku | General live edit | General/Optimized best ratio |
+|---|---:|---:|---:|---:|
+| immediate pre-change process | 48,664.5 / 86,211.3 | 997.2 / 1,051.9 | 47.5 / 55.2 | 48.80x |
+| first counted pump | 68,372.3 / 151,182.8 | 832.5 / 995.7 | 61.0 / 68.9 | 82.13x |
+| historical auto-frontier restored | 43,045.5 / 198,806.0 | 1,018.9 / 1,105.8 | 31.5 / 49.0 | 42.25x |
+| final canonical bounded ordering | 33,716.4 / 37,333.9 | 1,109.8 / 1,276.7 | 43.0 / 50.7 | 30.38x |
+
+The first implementation staged every newly registered General propagator before the first automatic
+assertion. That was semantically convergent but changed the historical auto path: it paid for a full initial
+top-state GAC pass instead of waking only the assertion frontier and leaving unrelated uninitialized
+constraints for `Stabilize`. It also woke downstream work only on value change, while the old assertion and
+retraction paths replayed touched cells even when support alone changed. Both differences were removed.
+Automatic assertions/retractions now feed the one shared pump from their historical frontier; explicit
+batched construction stages all work for the counted window. This restored the intended behavior and the
+control rows.
+
+The machine slowed and recovered unevenly during the long session, including a very large General mean in
+the third process. Consequently the cross-process absolute changes are observations, not regression or
+speedup claims. The final General Sudoku and live-edit bests are respectively 0.69x and 0.91x their
+pre-change observations; Optimized is 1.11x. Those controls show no broad auto-path penalty, while their
+varying same-run ratios show why no isolated absolute is treated as proof.
+
+The bounded seam has a direct same-process comparison on the same two-hop scalar network. Each action builds
+one network, registers the same two named constraints, applies the same premise, and reaches the same exact
+value. The bounded action additionally constructs the typed snapshot and combined evidence required by its
+result.
+
+| final paired row | best | mean | same-run reading |
+|---|---:|---:|---|
+| automatic two-hop closure | 57.3 us | 63.8 us | existing auto-quiescent path |
+| bounded two-hop closure | 100.0 us | 111.1 us | explicit count + canonical order + snapshot/evidence |
+| bounded / automatic | 1.75x | 1.74x | bounded result cost is local; automatic callers do not pay its materialization |
+
+Correctness included exact budgets 0/1/2/3, zero-budget pending/fixpoint distinction, negative-budget
+validation, observer calls excluded from the count, final-event contradiction precedence, premise plus
+structural contradiction support, retraction preserving structural evidence, rich and finite General
+domains, and equivalent constraint/input permutations. The stronger permutation deliberately registers a
+weak and a strong unary constraint in opposite orders; canonical `ConstraintId`/cell ordering holds both at
+two events and identical evidence, whereas raw authored queue order would produce one versus two events.
+
+`propagator-number-types.fsx`, `propagator-friendly.tests.fsx`, `propagator-wfc-app.fsx`, and the load-safe
+core/facade scripts completed successfully. The historical standalone `propagator-mutable-core.fsx` printed
+matching solutions for all four Sudoku engines and passed its retraction check, but its subsequent benchmark
+did not finish within either the default ten-minute attempt or a two-minute `TRIALS=1`, `ITERS=1` attempt on
+the degraded machine. It does not load the changed canonical core, so that incomplete historical timing is
+reported here but is not evidence against the current regression result. No event log, profiler, or temporary
+instrumentation was retained.
+
+## 2026-07-13 addendum - bounded early-exit retention review fix
+
+Fable's bounded-closure review found that `Limited` and `ReachedBottom` discarded invocation-local work. The
+correction retains that work in the existing engine and replays an interrupted multi-output propagator from
+current state. It does not change the automatic General entry points or the Optimized engine. The complete
+`propagator-friendly.tests.fsx --benchmark` gate ran alone under .NET 9.0.12 in the established order. Values
+are best / mean microseconds; the preceding final row is repeated here for direct comparison.
+
+| checkpoint | General Sudoku | Optimized Sudoku | General live edit | General/Optimized best ratio |
+|---|---:|---:|---:|---:|
+| preceding bounded implementation | 33,716.4 / 37,333.9 | 1,109.8 / 1,276.7 | 43.0 / 50.7 | 30.38x |
+| retained-work review fix | 38,811.2 / 86,622.8 | 651.4 / 864.2 | 49.2 / 54.5 | 59.58x |
+
+The same current process measured the paired two-hop rows as follows.
+
+| checkpoint | automatic best / mean | bounded best / mean | bounded/automatic best ratio |
+|---|---:|---:|---:|
+| preceding bounded implementation | 57.3 / 63.8 | 100.0 / 111.1 | 1.75x |
+| retained-work review fix | 33.8 / 56.1 | 98.7 / 143.6 | 2.92x |
+
+The current bounded best is 0.99x the preceding observation; the larger paired ratio comes from the automatic
+best falling to 0.59x its preceding observation. General Sudoku and live-edit bests are 1.15x and 1.14x the
+preceding observations, while Optimized Sudoku is 0.59x. Given this machine's established variability, these
+cross-process movements are environmental observations. The same-run `59.58x` Sudoku ratio, stable bounded
+absolute, and complete green suite provide no evidence of an automatic-path regression from the review fix.
+
+Correctness in the timed process included retained budget-1 two-hop closure, an interrupted multi-output
+emission, bottom precedence while queued work remained, contradiction/retraction reuse, and rejection of
+re-entrant batched propagation. The full differential, finite, provenance, numeric, and WFC application
+gates also passed separately; automatic observer re-entry and every exact WFC fingerprint remained intact.

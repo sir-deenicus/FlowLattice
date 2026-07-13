@@ -1,0 +1,164 @@
+# Request: bounded General-face closure with structural provenance
+
+Date: 2026-07-13
+
+Requester: Codex (Sol 5.6), for BATS Phase 2 in the sibling `PatternLearner`
+repository
+
+Candidate source inspected: IncrementalControl commit
+`a2a36e73974492f26d33454487cb100f1ef2a0e4`
+
+## Why this is needed
+
+BATS Phase 2 is integrating genuine constraint propagation as an authoritative
+invariant evaluator for both rule firing and learned-rule admission. The
+chosen domain describes symbol measures with authored equations; closure must
+derive their consequences, distinguish contradiction from incomplete work,
+and carry the derivation's support into a typed BATS trace.
+
+The current IncrementalControl General face has the correct monotone core, but
+two required semantics are not exposed:
+
+1. General assertions and reads stabilize automatically to quiescence. There
+   is no explicit narrowing-event budget and no typed `Truncated` result, so a
+   caller cannot ensure that no hidden unbounded closure ran before enforcing
+   its budget.
+2. public support records external premises only. Structural relation/dataflow
+   identities are not part of contributions, so a contradiction cannot name
+   the authored equations and equality that produced it. Reconstructing those
+   identities after the fact in BATS would be a second, potentially divergent
+   explanation engine.
+
+This is a request for a small, domain-independent extension of the enduring
+General face. It must not introduce BATS vocabulary, search policy, or a
+second propagation implementation.
+
+## Requested semantic surface
+
+### 1. Explicit bounded propagation
+
+Provide an explicit General-face operation with the semantic shape:
+
+~~~fsharp
+type PropagationResult<'snapshot, 'support> =
+    | Fixpoint of snapshot: 'snapshot * narrowingEvents: int
+    | Contradiction of
+        snapshot: 'snapshot * support: 'support * narrowingEvents: int
+    | Truncated of partialSnapshot: 'snapshot * narrowingEvents: int
+
+propagate : maxNarrowingEvents: int -> network: GeneralNet<'a> ->
+    PropagationResult<_, _>
+~~~
+
+The concrete names and snapshot representation may follow IncrementalControl's
+own vocabulary, but these laws are required:
+
+- The budget counts **strict changes to a cell's aggregate information value**
+  after meet/recompute. It does not count queue pops, unchanged contribution
+  writes, observer calls, or propagator invocations.
+- No propagation may occur outside that accounting window for the batched
+  network. In particular, model construction, constraint registration,
+  assertions, reads, and support inspection must not first auto-quiesce the
+  same work invisibly.
+- If the queue becomes empty on the event that reaches the budget, the result
+  is `Fixpoint`; if work remains, it is `Truncated`.
+- Reaching bottom is immediately and monotonically conclusive. If a permitted
+  narrowing event reaches bottom, `Contradiction` takes precedence over
+  `Truncated`, including on the last permitted event.
+- Negative budgets are typed/validated misuse. A zero budget may return
+  `Fixpoint` only when no narrowing work remains; otherwise it returns
+  `Truncated` without hidden work.
+- Fixpoints and verdicts are independent of authored constraint enumeration
+  and legal scheduling order. The partial snapshot on truncation is honest but
+  is not claimed to be schedule-independent.
+- A truncated network may be discarded; resumability is not required for this
+  request.
+
+A batching or explicit-build API is expected because the existing convenient
+surface auto-stabilizes. Preserve that existing friendly behavior for current
+callers by layering it over the new explicit mechanism; do not silently change
+the established method and computation-expression dialects.
+
+### 2. Structural constraint provenance
+
+Support must distinguish retractable assertions from enduring authored
+constraints. A suitable semantic shape is:
+
+~~~fsharp
+type ConstraintId = private ConstraintId of string
+
+type Support =
+    { Premises: Set<Premise>
+      Constraints: Set<ConstraintId> }
+~~~
+
+Equivalent typed representations are acceptable. Required laws:
+
+- The caller supplies a stable `ConstraintId`; it must not be derived from
+  allocation or construction order.
+- Whenever a relation or dataflow constraint emits informative narrowing, its
+  own ID is unioned with the support of the information it consumed.
+- A bottom cell exposes both the premise support and structural constraint IDs
+  that contributed to it. Deterministic conservative support is sufficient;
+  a minimal unsatisfiable core is explicitly not required.
+- Premise retraction follows `Premises` only. Structural IDs describe the
+  enduring network and must not accidentally become retractable assumptions.
+- Support enumeration and display are canonical/deterministic and bounded by
+  the finite network; traces must not depend on hash/dictionary order.
+- Existing premise-only callers remain source-compatible where practical, or
+  receive a direct, documented migration path rather than an untyped string
+  fallback.
+
+This provenance belongs in the propagation contributions themselves. Do not
+solve it by asking BATS to infer a proof graph from the final values.
+
+## Scope and architectural constraints
+
+- Extend the **General** face and its one canonical core. Do not use or modify
+  the optimized/WFC policy machinery for this request.
+- Do not call `solve`, `solutions`, `generate`, or any search/backtracking verb.
+- Preserve monotone meet semantics, local bottom, confluence at fixpoint,
+  existing retraction behavior, observers, both friendly dialects, and the
+  core/friendly dependency boundary.
+- Keep the mechanism generic over lattice and finite General domains. The
+  motivating BATS adapter will use a small exact scalar information lattice,
+  but scalar-measure concepts do not belong in IncrementalControl.
+- Avoid an event-log allocation on the propagation hot loop. The result needs
+  the count, final/partial state, and contradiction support; a full event trace
+  is not requested.
+- Prefer the smallest direct public extension. Do not expose private GAC or
+  create a parallel engine merely to satisfy the tests.
+
+## Required verification
+
+Please add focused executable checks for:
+
+1. a two-hop chain that reaches the same fixpoint under permuted constraint
+   construction order;
+2. an exact budget boundary: fixpoint when the final narrowing consumes the
+   last event, and `Truncated` when one more narrowing is pending;
+3. a budget of one returning a typed partial result without completing hidden
+   work;
+4. contradiction on the last permitted event taking precedence over
+   truncation;
+5. contradiction support containing the stable IDs of the relevant structural
+   constraints plus the contributing premises;
+6. premise retraction restoring/recomputing values while structural IDs remain
+   structural and non-retractable;
+7. identical final values, verdict, event count, and canonical support under
+   input/constraint permutations that are semantically equivalent;
+8. the complete existing IncrementalControl regression suite remaining green;
+9. a representative same-run benchmark confirming that the explicit bounded
+   seam does not materially penalize the existing auto-quiescent path. Report
+   relative ratios, not cross-run absolute conclusions.
+
+## Requested response
+
+Record the selected API, exact event-counting law, compatibility consequences,
+tests, benchmark ratios, commit/source identity, and any contradiction with
+the request in IncrementalControl's authoritative design/history according to
+its append-only convention. If the current architecture cannot provide either
+capability without a materially larger redesign, stop and report that boundary
+rather than emulating the contract superficially.
+
+Signed: Codex (Sol 5.6) — 2026-07-13

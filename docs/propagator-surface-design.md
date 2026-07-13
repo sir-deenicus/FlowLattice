@@ -1175,6 +1175,148 @@ core without new cross-workload evidence. Full measurements and sequential-ablat
 
 -- Codex, 2026-07-11
 
+**Codex current suggestion, 2026-07-13 - retain bounded General closure with structural provenance.**
+The accepted request was authored for BATS Phase 2 in the sibling PatternLearner repository, but the
+selected mechanism contains no BATS vocabulary. It extends the enduring General propagator face over any
+finite representation or rich meet-semilattice. The inspected source identity and implementation base is
+commit `a2a36e73974492f26d33454487cb100f1ef2a0e4`; the resulting worktree had no new commit identity when
+this record was written.
+
+The public extension is deliberately small:
+
+```fsharp
+type ConstraintId = private ConstraintId of string
+
+type Support =
+    { Premises: Set<Premise>
+      Constraints: Set<ConstraintId> }
+
+type PropagationResult<'a> =
+    | Fixpoint of CellSnapshot<'a> list * narrowingEvents: int
+    | Contradiction of CellSnapshot<'a> list * Support * narrowingEvents: int
+    | Truncated of CellSnapshot<'a> list * narrowingEvents: int
+```
+
+`ConstraintId.create` validates a stable caller-authored identity. `Constraint.named` attaches one to an
+existing relation or dataflow box; `General.constrainNamed`, `convertNamed`, and `combineNamed` are direct
+authoring forms. One authored relation may lower to multiple internal propagators, such as both directions
+of `convert` or repeated relation scopes; those private contribution slots remain distinct while sharing
+the authored ID. `General.evidence` returns both support axes. The old `General.support : Set<Premise>` and
+Friendly `Support` remain premise-only compatibility views, so existing callers and both Friendly dialects
+remain source-compatible. A caller requiring structural evidence migrates by naming each relevant
+constraint and reading `evidence` or the support carried by a propagation result. Unnamed compatibility
+constraints intentionally contribute no invented allocation-derived structural identity.
+
+Explicit closure is selected at construction, not switched onto a possibly settled network:
+`lowerBatchedWith`, `lowerBatched`, `createBatched`, `createBatchedLattice`, and `createBatchedFinite` build
+the same `GeneralNet` and canonical `Closure.Engine`, but leave constraint registration, assertions,
+retractions, reads, and support inspection passive. `General.propagate maxNarrowingEvents net` is then the
+only closure window. `solve` and `generate` reject batched networks rather than running hidden unbounded
+work. Existing factories retain their established auto-quiescent behavior and call the same pump without a
+practical bound. The Optimized/WFC engine and policy machinery were not changed.
+
+The exact counting law is:
+
+1. One event is one strict change to a cell's aggregate information value after all current contributions
+   are met and compared with the lattice's supplied `equals`. Retraction restorations also count because
+   the contract is strict aggregate change despite the result field retaining the requested
+   `narrowingEvents` name.
+2. Queue pops, propagator invocations, unchanged contribution writes, support-only recomputation, and
+   observer calls do not count. Observer handlers remain synchronous and may re-enter through an
+   invocation-local pump.
+3. A negative budget is `ArgumentException`. At zero, pending work returns `Truncated` without firing;
+   an empty queue returns `Fixpoint` with zero events.
+4. When the event consuming the budget leaves no queued work, the result is `Fixpoint`; otherwise it is
+   `Truncated`. A permitted event reaching bottom returns `Contradiction` immediately, including on the
+   final event, and carries that cell's combined support.
+5. Named bounded work uses `ConstraintId` plus stable cell identity for canonical initial and wake order.
+   This makes final event counts and evidence independent of equivalent constraint/input enumeration while
+   preserving the automatic path's historical queue order. Fixpoints and verdicts still follow the
+   underlying monotone/confluent General semantics; no cross-implementation claim is made for a truncated
+   partial snapshot.
+6. A truncated network is disposable, as requested. Remaining dequeued work is not retained as a resume
+   protocol. The returned partial snapshot is the supported observation boundary.
+
+Structural provenance rides the existing contribution path. `Origin.Prop int` remains the private
+dictionary key, and its propagator carries the stable `ConstraintId`. On an informative emission, the ID is
+added to the support already unioned from consumed cells; recomputation unions both sets for every non-top
+contribution. Retraction tests only `Premises`, so structural IDs can explain a contradiction without
+becoming retractable assumptions. Both sets use ordered F# `Set`, snapshots are canonical by stable cell
+identity, and no event log or second proof engine was introduced.
+
+Focused executable checks cover the exact 0/1/2/3-event two-hop boundary, no hidden read/support closure,
+negative budgets, observer accounting, final-event contradiction precedence, combined contradiction
+support, retraction with structural evidence retained, equivalent input and construction permutations, a
+weak/strong same-cell permutation whose count would differ under authored order, and a batched finite
+relation. The full Friendly differential, sparse/ordinary Sudoku, scalar/interval/fixed-point, provenance,
+observer, retraction, generalized finite, multiword, WFC application, and load-safe core/facade checks pass.
+
+The final fixed-order .NET 9.0.12 process measured General Sudoku at `33,716.4 / 37,333.9 us`, Optimized
+Sudoku at `1,109.8 / 1,276.7 us`, and the General live-edit cycle at `43.0 / 50.7 us` (best / mean), a
+same-run `30.38x` General/Optimized best ratio. The paired two-hop check measured automatic closure at
+`57.3 / 63.8 us` and bounded closure including result snapshot/evidence construction at
+`100.0 / 111.1 us`, a `1.75x` best ratio. The pre-change process measured `48,664.5 / 86,211.3 us`,
+`997.2 / 1,051.9 us`, and `47.5 / 55.2 us` for the three established rows. The machine degraded during the
+long session, so those cross-process absolutes are environmental observations; the same-run ratios and the
+absence of a control-wide auto-path regression are the decision evidence. Full details are appended to
+[benchmarks.md](benchmarks.md).
+
+Retain this direct extension. Do not add a proof graph, event log, resumable continuation, BATS adapter,
+alternate General engine, or Optimized/WFC machinery on the current request.
+
+-- Codex, 2026-07-13
+
+**Codex current suggestion, 2026-07-13 - retain bounded early-exit work and fence network reuse.**
+The Fable review gate recorded below found that the first bounded implementation made an invalid distinction
+between a disposable result and a disposable engine. The request did not require resumability, but the
+returned `GeneralNet` remained callable: after `Truncated`, its invocation-local queue had been lost and a
+second call could report `Fixpoint(_, 0)` over an unclosed snapshot. This suggestion supersedes only point 6,
+the unqualified observer re-entry statement in point 2, and the over-broad scheduling statement in point 5
+of the preceding current suggestion. Its API, counting law, provenance model, and compatibility decisions
+otherwise remain current.
+
+Keep early-exit work in the existing engine. On `Limited` or `ReachedBottom`, move every unfired local work
+item back to the engine's `pending` queue. If a multi-output propagator was interrupted between emissions,
+stage that `Fire` again instead of retaining the stale remainder of its output list. A refire reads current
+cell state and rewrites the same private contribution slots; already-applied outputs are unchanged and do
+not consume events, while previously unapplied outputs remain reachable. This is ordinary idempotent work
+replay, not a continuation object, event log, second engine, or new public abstraction.
+
+`Fixpoint` now means both the invocation-local and retained queues are empty. A budget exit scans current
+cells for bottom before returning `Truncated`, so known contradiction remains conclusive even when work is
+still pending. A strict change schedules its dependent work before an immediate contradiction result is
+returned, allowing a later premise retraction to resume from an honest pending frontier. Retraction still
+follows premise support alone and structural evidence remains non-retractable.
+
+Synchronous automatic-network observer re-entry remains supported by invocation-local automatic pumps.
+Explicit `General.propagate` on a batched network now has a narrow in-progress guard: an observer may not
+recursively open a second budget window on that same engine. Such a call raises `InvalidOperationException`;
+the outer bounded call remains valid if the handler catches it. This prevents two nested counters from
+competing over the shared pending queue without constraining the established automatic observer contract.
+
+The bounded schedule-invariance guarantee requires distinct authored cell names and distinctly named
+constraints with distinct `(ConstraintId, reads)` ordering keys. Unnamed constraints, duplicate keys, and
+duplicate cell names use construction-order fallback and carry no permutation guarantee; this limits
+event-count ordering claims, not General's monotone fixpoint/confluence law. Internal cell IDs preserve
+runtime identity but do not turn duplicate authored names into stable permutation keys.
+
+Focused regressions now prove that a two-hop chain truncated at budget one completes on the same network,
+that an interrupted two-output propagator replays its missing emission, that bottom beats zero-budget
+truncation while work is retained, that post-retraction closure remains valid, and that nested bounded
+propagation is rejected without breaking automatic observer re-entry. The complete differential, numeric,
+generalized-finite, and WFC application gates pass. In the isolated fixed-order benchmark process, General
+Sudoku measured `38,811.2 / 86,622.8 us`, Optimized Sudoku `651.4 / 864.2 us`, and General live edit
+`49.2 / 54.5 us`; the same-run Sudoku best ratio was `59.58x`. Two-hop automatic and bounded closure measured
+`33.8 / 56.1 us` and `98.7 / 143.6 us`, respectively (`2.92x` best). The bounded best remains near the prior
+`100.0 us`; the ratio changed because this run's automatic best was faster. Full measurement context is in
+[benchmarks.md](benchmarks.md).
+
+Retain this direct correction and lift the surface only with these reuse and scheduling preconditions. The
+bounded engine is resumable in the modest sense that honest pending work is not destroyed; it does not expose
+or promise a portable serialized continuation.
+
+-- Codex, 2026-07-13
+
 ## 11. Dated history
 
 - **2026-07-05 - Codex.** Added the current suggestion above: provisionally accept write-once authoring,
@@ -1487,6 +1629,81 @@ core without new cross-workload evidence. Full measurements and sequential-ablat
   constraint-only structural baseline; added nested observer re-entry coverage. Final ramp512/ramp128 rows
   were within 1.13x/1.32x of the specialized historical rerun while all finite and WFC controls remained
   correct. Detailed checkpoints and comparison boundaries were appended rather than rewriting prior history.
+
+- **2026-07-13 - Codex (bounded General closure and structural provenance completed).** Implemented the
+  PatternLearner-requested capability as a domain-independent extension of the one General closure engine.
+  Batched factories defer all closure to typed `Fixpoint` / `Contradiction` / `Truncated` propagation;
+  strict aggregate changes are the counted event, final-event bottom wins, and named bounded work uses stable
+  constraint/cell ordering under equivalent enumeration. Contributions now retain separate premise and
+  structural-ID sets, while retraction follows premises only. Existing auto-quiescent General/Friendly
+  behavior, premise-only support calls, both Friendly dialects, and Optimized/WFC machinery remain intact.
+  Exact budget, provenance, permutation, retraction, observer, finite-domain, differential, Sudoku, numeric,
+  generalized finite, and WFC application gates passed. The final same-run controls measured a 30.38x
+  Optimized/General Sudoku ratio and 1.75x bounded/automatic two-hop ratio including bounded result materialization;
+  the detailed laws, compatibility path, source identity, and variable-machine timing context are in the
+  current suggestion above and [benchmarks.md](benchmarks.md).
+- **2026-07-13 - Fable (Tier 0) bounded-closure review gate.** Statically audited the bounded General
+  closure and structural provenance against the accepted request before any library lift. The counting law,
+  no-hidden-closure batching, zero/negative budget handling, final-event contradiction precedence, combined
+  contradiction support, premise-only retraction, canonical named scheduling, and the focused checks all
+  hold as documented (request checks 1-7 and 9 verified by reading; check 8 accepted on the reported run —
+  this summon executes no scripts). **One defect locked before the lift:** `Pump`'s work queue is
+  invocation-local, and an early exit (`Limited` or `ReachedBottom`) discards awoken-but-unfired
+  propagators and un-applied emissions without restaging them. A second `propagate` on the same batched
+  network then reports `Fixpoint(_, 0)` over a visibly unclosed snapshot — trace: two-hop chain, budget 1
+  → `Truncated(1)` drops the a→b wake; re-propagate with any budget → `Fixpoint` with b and c still top.
+  `Fixpoint` is the quiescence claim downstream admission logic relies on, so this is a soundness hole,
+  not a documentation gap; suggestion point 6's "disposable" note does not fence it because the engine
+  keeps serving. Poisoning after non-`Fixpoint` is the wrong fix: the contradiction/retraction regression
+  itself legitimately reuses the net after `Contradiction`, and the same wake loss is latent there
+  whenever bottom is reached while work remains queued (retraction only recomputes cells that lost
+  contributions; dropped wakes never refire). Work order (locked): **retain leftover work** — on early
+  exit drain the local queue back into `pending`, re-enqueueing `Fire` of a mid-emission propagator; every
+  work item is an idempotent read-of-current-state, so retention is semantically safe, unchanged refires
+  stay uncounted, and retained events surfacing on a later call are honest work. Add the regression:
+  budget-1 truncation, then re-propagation to completion must yield the true fixpoint, and `Fixpoint`
+  must never be returned while closure is incomplete. Three advisories, none blocking: (a) the
+  permutation-invariance guarantee holds for named constraints with distinct `(id, reads)` keys and
+  distinct cell names — unnamed propagators and duplicate keys tie-break by construction order (`pid`
+  fallback; unstable `Array.sortInPlaceBy` ties); state that as the guarantee's precondition. (b) A bottom
+  pre-existing a `propagate` call surfaces as `Contradiction` only through the empty-queue terminal scan,
+  so budget exhaustion first returns `Truncated` over a known-contradicted net — cheap to also bottom-scan
+  on the `Limited` exit. (c) Re-entrant `propagate` from an observer handler on a batched network is
+  unfenced (shared `pending`, nested budget windows) — document or guard. With the locked fix and its
+  regression in, the request is answered and the surface is fit to lift into a proper library.
+
+- **2026-07-13 - Codex (bounded early-exit retention gate closed).** Implemented Fable's locked correction
+  within the one `Closure.Engine`: early `Limited` and `ReachedBottom` exits retain queued work, an interrupted
+  multi-output `Fire` is replayed from current state, budget exits prefer a pre-existing bottom, and nested
+  batched `General.propagate` calls are rejected while automatic observer re-entry remains intact. Added
+  executable checks for budget-1 two-hop continuation to a true fixpoint, mid-emission replay, queued-bottom
+  precedence, post-contradiction retraction, and the re-entry guard. Clarified that permutation-invariant
+  event counts require distinct cell names and distinct named-constraint ordering keys. All canonical, numeric,
+  generalized-finite, WFC, load-safety, and same-process benchmark gates passed; the latest process retained
+  a `59.58x` Optimized/General Sudoku best ratio and measured bounded/automatic two-hop closure at `2.92x`.
+
+- **2026-07-13 - Fable (Tier 0) retained-work verification; bounded-closure gate CLOSED.** Statically
+  re-audited the retained-work correction at the same uncommitted worktree over `a2a36e7` (no scripts
+  executed this summon; full-suite greenness and benchmark numbers accepted on the author's run report).
+  The locked defect is fixed as ordered: `retainWork` drains the invocation-local queue and staged work
+  back into the engine's `pending` on every early exit, and an interrupted multi-output propagator is
+  restaged as a whole `Fire` — idempotent replay from current state, unchanged rewrites uncounted, no
+  continuation object or second engine. `Fixpoint` is now returned only when both queues are empty, which
+  closes the false-`Fixpoint(_, 0)`-after-`Truncated` trace. The mandatory regression is present and
+  correct (`resumedAfterTruncation`: budget-1 truncation, resumption to a true fixpoint with additive
+  event counts `1 + 2 = 3` matching the single-run count, then `Fixpoint(_, 0)` on a zero-budget
+  re-check), plus a stronger mid-emission replay check (`interruptedEmission`: three budget-1 windows
+  complete a two-output fanout, with the already-applied output's rewrite correctly uncounted). All three
+  advisories were addressed: (a) the distinct-cell-name / distinct-`(ConstraintId, reads)` precondition
+  is now stated as the scheduling guarantee's precondition rather than an unqualified claim; (b) budget
+  exits scan for a pre-existing bottom so known contradiction beats truncation — a sanctioned
+  strengthening of the request's zero-budget letter, verified by `bottomAtLimit`; (c) nested batched
+  `propagate` from an observer is fenced with `InvalidOperationException` while automatic observer
+  re-entry is preserved, verified by `batchedObserverReentryRejected` and `automaticObserverReentry`.
+  The contradiction path now also retains its frontier, so the post-retraction resume (`restored`,
+  `Fixpoint(_, 1)`) is honest rather than accidentally complete. No new defects found. **Verdict: PASS —
+  the bounded General face is fit to lift into a proper library**, carrying the documented reuse and
+  naming preconditions with it. Signed: Claude Fable 5 — tier-0 summon, Mythos-class. 2026-07-13.
 
 ## 12. The dependency boundary and the observation split
 

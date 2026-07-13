@@ -911,6 +911,388 @@ module private FiniteCoreRegression =
         && binaryHotPathEdges ()
         && multiwordObserverReentry ()
 
+module private BoundedGeneralRegression =
+
+    type Measure =
+        | Unknown
+        | Exact of int
+        | Conflict
+
+    let private meet left right =
+        match left, right with
+        | Unknown, value | value, Unknown -> value
+        | Conflict, _ | _, Conflict -> Conflict
+        | Exact left, Exact right when left = right -> Exact left
+        | Exact _, Exact _ -> Conflict
+
+    let private domain () =
+        Domain.lattice Unknown meet (function Conflict -> true | _ -> false)
+
+    let private payload = function
+        | Exact value -> Some value
+        | Unknown | Conflict -> None
+
+    let private state name snapshot =
+        snapshot
+        |> List.find (fun entry -> entry.cell.name = name)
+        |> fun entry -> entry.state
+
+    let private normalize snapshot =
+        snapshot
+        |> List.map (fun entry ->
+            entry.cell.name,
+            entry.state,
+            (entry.support.Premises |> Seq.map (fun premise -> premise.pid) |> Seq.toList),
+            (entry.support.Constraints |> Seq.map ConstraintId.value |> Seq.toList))
+
+    let private buildChain reverseConstraints =
+        let net = General.createBatchedLattice (domain ())
+        let a = General.cell net "chain-a"
+        let b = General.cell net "chain-b"
+        let c = General.cell net "chain-c"
+        let ab = ConstraintId.create "chain.a-b"
+        let bc = ConstraintId.create "chain.b-c"
+        let addAB () = General.combineNamed net ab [ a ] b payload Exact List.exactlyOne
+        let addBC () = General.combineNamed net bc [ b ] c payload Exact List.exactlyOne
+        if reverseConstraints then
+            addBC ()
+            addAB ()
+        else
+            addAB ()
+            addBC ()
+        let premise = General.freshPremise net
+        General.assertUnder net premise a (Exact 7)
+        net, a, b, c, premise, ab, bc
+
+    let private exactBoundaries () =
+        let quiescent = General.createBatchedLattice (domain ())
+        General.cell quiescent "idle" |> ignore
+        let zeroFixpoint =
+            match General.propagate 0 quiescent with
+            | Fixpoint(snapshot, 0) -> state "idle" snapshot = LatticeValue Unknown
+            | _ -> false
+
+        let zeroNet, zeroA, _, zeroC, _, _, _ = buildChain false
+        let noHiddenWork =
+            General.value zeroNet zeroA = LatticeValue Unknown
+            && General.value zeroNet zeroC = LatticeValue Unknown
+            && Set.isEmpty (General.support zeroNet zeroA)
+            && Set.isEmpty (General.evidence zeroNet zeroA).Constraints
+        let zeroTruncated =
+            match General.propagate 0 zeroNet with
+            | Truncated(snapshot, 0) ->
+                state "chain-a" snapshot = LatticeValue Unknown
+                && state "chain-c" snapshot = LatticeValue Unknown
+            | _ -> false
+
+        let oneNet, _, _, _, _, _, _ = buildChain false
+        let oneEvent =
+            match General.propagate 1 oneNet with
+            | Truncated(snapshot, 1) ->
+                state "chain-a" snapshot = LatticeValue (Exact 7)
+                && state "chain-b" snapshot = LatticeValue Unknown
+                && state "chain-c" snapshot = LatticeValue Unknown
+            | _ -> false
+
+        let resumedAfterTruncation =
+            let net, _, _, _, premise, ab, bc = buildChain false
+            match General.propagate 1 net with
+            | Truncated(partial, 1) when state "chain-b" partial = LatticeValue Unknown ->
+                match General.propagate 10 net with
+                | Fixpoint(snapshot, 2) ->
+                    let c = snapshot |> List.find (fun entry -> entry.cell.name = "chain-c")
+                    c.state = LatticeValue (Exact 7)
+                    && c.support.Premises = Set.singleton premise
+                    && c.support.Constraints = Set.ofList [ ab; bc ]
+                    &&
+                        (match General.propagate 0 net with
+                         | Fixpoint(_, 0) -> true
+                         | _ -> false)
+                | _ -> false
+            | _ -> false
+
+        let twoNet, _, _, _, _, _, _ = buildChain false
+        let twoEvents =
+            match General.propagate 2 twoNet with
+            | Truncated(snapshot, 2) ->
+                state "chain-b" snapshot = LatticeValue (Exact 7)
+                && state "chain-c" snapshot = LatticeValue Unknown
+            | _ -> false
+
+        let threeNet, _, _, _, premise, ab, bc = buildChain false
+        let exactFixpoint =
+            match General.propagate 3 threeNet with
+            | Fixpoint(snapshot, 3) ->
+                let c = snapshot |> List.find (fun entry -> entry.cell.name = "chain-c")
+                c.state = LatticeValue (Exact 7)
+                && c.support.Premises = Set.singleton premise
+                && c.support.Constraints = Set.ofList [ ab; bc ]
+            | _ -> false
+
+        let negativeRejected =
+            let net, _, _, _, _, _, _ = buildChain false
+            try
+                General.propagate -1 net |> ignore
+                false
+            with :? System.ArgumentException -> true
+
+        let automaticRejected =
+            let net = General.createLattice (domain ())
+            try
+                General.propagate 0 net |> ignore
+                false
+            with :? System.InvalidOperationException -> true
+
+        let observerAccounting =
+            let net, _, _, _, _, _, _ = buildChain false
+            let mutable callbacks = 0
+            use subscription = General.onNet net (fun _ -> callbacks <- callbacks + 1)
+            let initialReplayOnly = callbacks = 3
+            match General.propagate 3 net with
+            | Fixpoint(_, 3) -> initialReplayOnly && callbacks = 6
+            | _ -> false
+
+        zeroFixpoint
+        && noHiddenWork
+        && zeroTruncated
+        && oneEvent
+        && resumedAfterTruncation
+        && twoEvents
+        && exactFixpoint
+        && negativeRejected
+        && automaticRejected
+        && observerAccounting
+
+    let private interruptedEmission () =
+        let net = General.createBatchedLattice (domain ())
+        let source = General.cell net "fanout-source"
+        let left = General.cell net "fanout-left"
+        let right = General.cell net "fanout-right"
+        let fanout = ConstraintId.create "fanout.source-outputs"
+        General.constrainNamed net fanout
+            (Dataflow
+                { constraintId = None
+                  cells = [ source ]
+                  outputs = [ left; right ]
+                  narrow = function
+                      | [ Exact value ] -> [ Some (Exact (value + 1)); Some (Exact (value + 2)) ]
+                      | [ Unknown ] | [ Conflict ] -> [ None; None ]
+                      | _ -> invalidArg "values" "fanout expected one source value" })
+        let premise = General.freshPremise net
+        General.assertUnder net premise source (Exact 7)
+
+        match General.propagate 1 net with
+        | Truncated(first, 1) when state "fanout-left" first = LatticeValue Unknown ->
+            match General.propagate 1 net with
+            | Truncated(second, 1) ->
+                state "fanout-left" second = LatticeValue (Exact 8)
+                && state "fanout-right" second = LatticeValue Unknown
+                &&
+                    (match General.propagate 1 net with
+                     | Fixpoint(final, 1) ->
+                         let right = final |> List.find (fun entry -> entry.cell.name = "fanout-right")
+                         right.state = LatticeValue (Exact 9)
+                         && right.support.Premises = Set.singleton premise
+                         && right.support.Constraints = Set.singleton fanout
+                     | _ -> false)
+            | _ -> false
+        | _ -> false
+
+    let private constructionPermutation () =
+        let forward, _, _, _, _, _, _ = buildChain false
+        let reverse, _, _, _, _, _, _ = buildChain true
+        let chainOrder =
+            match General.propagate 3 forward, General.propagate 3 reverse with
+            | Fixpoint(left, leftEvents), Fixpoint(right, rightEvents) ->
+                leftEvents = 3 && rightEvents = 3 && normalize left = normalize right
+            | _ -> false
+
+        let narrowingOrder reverseConstraints =
+            let net = General.createBatchedFinite [ 1; 2; 3 ]
+            let cell = General.cell net "ordered-narrowing"
+            let weak = ConstraintId.create "01.weak"
+            let strong = ConstraintId.create "02.strong"
+            let addWeak () =
+                General.constrainNamed net weak
+                    (Constraint.relation [ cell ] (function [ value ] -> value <= 2 | _ -> false))
+            let addStrong () =
+                General.constrainNamed net strong
+                    (Constraint.relation [ cell ] (function [ value ] -> value = 1 | _ -> false))
+            if reverseConstraints then
+                addStrong ()
+                addWeak ()
+            else
+                addWeak ()
+                addStrong ()
+            match General.propagate 10 net with
+            | Fixpoint(snapshot, events) -> normalize snapshot, events
+            | result -> failwithf "canonical narrowing-order regression: %A" result
+
+        let leftSnapshot, leftEvents = narrowingOrder false
+        let rightSnapshot, rightEvents = narrowingOrder true
+        chainOrder
+        && leftEvents = 2
+        && rightEvents = 2
+        && leftSnapshot = rightSnapshot
+
+    let private buildContradiction sourceFirst =
+        let net = General.createBatchedLattice (domain ())
+        let source = General.cell net "conflict-source"
+        let target = General.cell net "conflict-target"
+        let equality = ConstraintId.create "equation.source-target"
+        General.combineNamed net equality [ source ] target payload Exact List.exactlyOne
+        let conflicting = General.freshPremise net
+        let asserted = General.freshPremise net
+        let assertSource () = General.assertUnder net asserted source (Exact 1)
+        let assertTarget () = General.assertUnder net conflicting target (Exact 2)
+        if sourceFirst then
+            assertSource ()
+            assertTarget ()
+        else
+            assertTarget ()
+            assertSource ()
+        net, target, asserted, conflicting, equality
+
+    let private contradictionAndRetraction () =
+        let shortNet, _, _, _, _ = buildContradiction false
+        let stopsBeforeBottom =
+            match General.propagate 2 shortNet with
+            | Truncated(snapshot, 2) -> state "conflict-target" snapshot = LatticeValue (Exact 2)
+            | _ -> false
+
+        let bottomNet, bottomTarget, _, _, equality = buildContradiction false
+        let bottomSink = General.cell bottomNet "conflict-sink"
+        General.combineNamed bottomNet (ConstraintId.create "equation.target-sink")
+            [ bottomTarget ] bottomSink payload Exact List.exactlyOne
+        let bottomAtLimit =
+            match General.propagate 3 bottomNet with
+            | Contradiction(_, _, 3) ->
+                match General.propagate 0 bottomNet with
+                | Contradiction(_, support, 0) -> support.Constraints = Set.singleton equality
+                | _ -> false
+            | _ -> false
+
+        let net, target, asserted, conflicting, equality = buildContradiction false
+        let lastEventWins =
+            match General.propagate 3 net with
+            | Contradiction(snapshot, support, 3) ->
+                state "conflict-target" snapshot = LatticeValue Conflict
+                && support.Premises = Set.ofList [ asserted; conflicting ]
+                && support.Constraints = Set.singleton equality
+            | _ -> false
+        General.retract net conflicting
+        let restored =
+            match General.propagate 1 net with
+            | Fixpoint(snapshot, 1) ->
+                let targetState = snapshot |> List.find (fun entry -> entry.cell = target)
+                targetState.state = LatticeValue (Exact 1)
+                && targetState.support.Premises = Set.singleton asserted
+                && targetState.support.Constraints = Set.singleton equality
+                && General.support net target = Set.singleton asserted
+            | _ -> false
+
+        let first, _, _, _, _ = buildContradiction false
+        let second, _, _, _, _ = buildContradiction true
+        let permutation =
+            match General.propagate 3 first, General.propagate 3 second with
+            | Contradiction(left, leftSupport, leftEvents), Contradiction(right, rightSupport, rightEvents) ->
+                leftEvents = rightEvents
+                && leftEvents = 3
+                && normalize left = normalize right
+                && leftSupport = rightSupport
+            | _ -> false
+        stopsBeforeBottom && bottomAtLimit && lastEventWins && restored && permutation
+
+    let private finiteRelation () =
+        let net = General.createBatchedFinite [ 1; 2 ]
+        let left = General.cell net "finite-left"
+        let right = General.cell net "finite-right"
+        let equality = ConstraintId.create "finite.equality"
+        General.constrainNamed net equality
+            (Constraint.relation [ left; right ] (function [ a; b ] -> a = b | _ -> false))
+        let premise = General.freshPremise net
+        General.assertUnder net premise left 1
+        match General.propagate 10 net with
+        | Fixpoint(snapshot, 2) ->
+            let target = snapshot |> List.find (fun entry -> entry.cell = right)
+            target.state = FiniteCandidates [ 1 ]
+            && target.support.Premises = Set.singleton premise
+            && target.support.Constraints = Set.singleton equality
+        | _ -> false
+
+    let private automaticObserverReentry () =
+        let net = General.createLattice (domain ())
+        let source = General.cell net "observer-source"
+        let target = General.cell net "observer-target"
+        let nested = General.cell net "observer-nested"
+        let equation = ConstraintId.create "observer.source-target"
+        General.combineNamed net equation [ source ] target payload Exact List.exactlyOne
+        let mutable armed = false
+        let mutable nestedPremise = None
+        use subscription =
+            General.onCell net target (fun (_, current) ->
+                if armed && current = LatticeValue (Exact 5) then
+                    armed <- false
+                    nestedPremise <- Some (General.assume net nested (Exact 9)))
+        armed <- true
+        let sourcePremise = General.assume net source (Exact 5)
+        match nestedPremise with
+        | Some nestedPremise ->
+            not armed
+            && General.value net target = LatticeValue (Exact 5)
+            && General.value net nested = LatticeValue (Exact 9)
+            && General.evidence net target =
+                { Premises = Set.singleton sourcePremise
+                  Constraints = Set.singleton equation }
+            && General.support net nested = Set.singleton nestedPremise
+        | None -> false
+
+    let private batchedObserverReentryRejected () =
+        let net, _, target, _, _, _, _ = buildChain false
+        let mutable attempted = false
+        let mutable rejected = false
+        use subscription =
+            General.onCell net target (fun (_, current) ->
+                if current = LatticeValue (Exact 7) then
+                    attempted <- true
+                    try
+                        General.propagate 1 net |> ignore
+                    with :? System.InvalidOperationException ->
+                        rejected <- true)
+        match General.propagate 3 net with
+        | Fixpoint(snapshot, 3) ->
+            attempted
+            && rejected
+            && state "chain-c" snapshot = LatticeValue (Exact 7)
+        | _ -> false
+
+    let benchmarkAutomatic () =
+        let net = General.createLattice (domain ())
+        let a = General.cell net "timed-a"
+        let b = General.cell net "timed-b"
+        let c = General.cell net "timed-c"
+        General.combineNamed net (ConstraintId.create "timed.a-b") [ a ] b payload Exact List.exactlyOne
+        General.combineNamed net (ConstraintId.create "timed.b-c") [ b ] c payload Exact List.exactlyOne
+        let premise = General.freshPremise net
+        General.assertUnder net premise a (Exact 7)
+        if General.value net c <> LatticeValue (Exact 7) then
+            failwith "automatic chain benchmark failed"
+
+    let benchmarkBatched () =
+        let net, _, _, _, _, _, _ = buildChain false
+        match General.propagate 3 net with
+        | Fixpoint(_, 3) -> ()
+        | result -> failwithf "bounded chain benchmark failed: %A" result
+
+    let run () =
+        exactBoundaries ()
+        && interruptedEmission ()
+        && constructionPermutation ()
+        && contradictionAndRetraction ()
+        && finiteRelation ()
+        && automaticObserverReentry ()
+        && batchedObserverReentryRejected ()
+
 let main () =
     printfn "runtime: %s" (System.Runtime.InteropServices.RuntimeInformation.FrameworkDescription)
     printfn ""
@@ -1074,6 +1456,11 @@ let main () =
     printfn "  grouping, multiword, asymmetric tables, generation, replay, restart, and edits: %b" finiteCoreOk
     printfn ""
 
+    let boundedGeneralOk = BoundedGeneralRegression.run ()
+    printfn "== bounded General closure and structural provenance =="
+    printfn "  exact budgets, retained closure, provenance, re-entry guard, and finite relation: %b" boundedGeneralOk
+    printfn ""
+
     let ok =
         friendlyOk
         && friendlyFiniteUxOk
@@ -1084,6 +1471,7 @@ let main () =
         && guardOk
         && liveOk
         && finiteCoreOk
+        && boundedGeneralOk
     if ok && fsi.CommandLineArgs |> Array.contains "--benchmark" then
         let timedModel =
             Slices.sudoku4PairwiseWithGivens
@@ -1119,9 +1507,14 @@ let main () =
         let generalBest, generalMean = benchmark 3 3 5 generalSolve
         let optimizedBest, optimizedMean = benchmark 3 3 5 optimizedSolve
         let editBest, editMean = benchmark 100 5 500 editCycle
+        let automaticBest, automaticMean = benchmark 100 5 500 BoundedGeneralRegression.benchmarkAutomatic
+        let boundedBest, boundedMean = benchmark 100 5 500 BoundedGeneralRegression.benchmarkBatched
         printfn "  General lower+solve:     %.1f / %.1f us" generalBest generalMean
         printfn "  Optimized lower+solve:   %.1f / %.1f us" optimizedBest optimizedMean
         printfn "  General live edit cycle: %.1f / %.1f us" editBest editMean
+        printfn "  General 2-hop automatic: %.1f / %.1f us" automaticBest automaticMean
+        printfn "  General 2-hop bounded:   %.1f / %.1f us" boundedBest boundedMean
+        printfn "  Bounded/automatic ratio: %.2fx" (boundedBest / automaticBest)
         printfn "  Optimized/General speedup: %.2fx" (generalBest / optimizedBest)
         printfn ""
     if ok && fsi.CommandLineArgs |> Array.contains "--benchmark-read-sweep" then

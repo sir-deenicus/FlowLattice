@@ -30,6 +30,13 @@
   what changed and why that shape was chosen.
 - Be concrete rather than vague: name the important structure or behavior introduced, preserved, or
   changed.
+- Mix what changed with why that shape matters, using the fewest words that preserve both. A body that
+  only lists APIs, tests, or implementation steps is a diff summary; a body that gives only motivation is
+  too abstract.
+- Prefer one sentence naming the capability and compatibility boundary, followed when useful by one
+  sentence naming the decisive invariant or design choice.
+- Include implementation detail only when it explains externally meaningful behavior, prevents a likely
+  misunderstanding, or records why an alternative was rejected.
 - Let length follow missing context. Use the shortest message that makes the intent clear; do not force
   a one-line summary when a few brief body lines are necessary, and do not turn the message into a
   diff narration or mini-specification.
