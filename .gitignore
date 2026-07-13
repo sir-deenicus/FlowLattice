@@ -5,3 +5,5 @@ AsyncRx/bin/*
 AsyncRx/obj/*
 AsyncRx/**/bin/*
 AsyncRx/**/obj/*
+Propagator/obj/*
+Propagator/bin/*

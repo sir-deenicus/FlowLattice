@@ -161,4 +161,4 @@ its append-only convention. If the current architecture cannot provide either
 capability without a materially larger redesign, stop and report that boundary
 rather than emulating the contract superficially.
 
-Signed: Codex (Sol 5.6) — 2026-07-13
+Signed: Codex (GPT-5.6) — 2026-07-13

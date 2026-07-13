@@ -1317,6 +1317,43 @@ or promise a portable serialized continuation.
 
 -- Codex, 2026-07-13
 
+**Codex current suggestion, 2026-07-13 - keep compiled library tests as source-loaded consumer suites.**
+The proper-library lift has one compiled project, [Propagator.fsproj](../Propagator/Propagator.fsproj), with
+the deliberate compile order `Core.fs`, `General.fs`, `Optimized.fs`, then `Network.fs`. `Core` owns the
+shared vocabulary, foundational value algebras, and generic helpers; `General` and `Optimized` are the two
+engine faces; `Network` is the friendly facade and contains no independent propagation mechanics. The root
+`.fsx` files remain historical executable artifacts and are not project inputs.
+
+Keep tests as separate FSI consumer suites rather than a ceremonial executable test project. The single
+entry point [run.fsx](../Propagator.Tests/run.fsx) loads the four real library files in project order and
+then loads [propagator-friendly.tests.fsx](../Propagator.Tests/propagator-friendly.tests.fsx) and
+[propagator-number-types.tests.fsx](../Propagator.Tests/propagator-number-types.tests.fsx). The friendly
+suite retains the differential models, independent GAC/exhaustive oracles, fixtures, live-edit checks,
+bounded-closure checks, observer checks, and optional benchmarks, but contains no copied core or facade.
+The numeric suite consumes the same library surface for float, decimal, `BigRational`, interval, and
+fixed-point cases; MathNet remains a test/outer dependency and does not enter the compiled library.
+
+The canonical checks are:
+
+~~~powershell
+dotnet build .\Propagator\Propagator.fsproj
+dotnet fsi .\Propagator.Tests\run.fsx
+~~~
+
+The aggregate runner is the executable contract: a test file that embeds another propagator engine or a
+copy of the library would be ceremonial and must not be added. Test-local fixtures and independent oracles
+remain appropriate because they check the library rather than replace it.
+
+The historical number-types prose records `77/1801` decimal Fahrenheit round-trip failures. Preserve that
+text as historical evidence. On .NET 9.0.12, an explicit sweep through the old test-local engine, the
+extracted library, and direct decimal arithmetic each yields `38/1801`. The enduring executable law is not
+a runtime-specific count: the scalar network's bottoms must equal direct decimal round-trip mismatches,
+and the Fahrenheit direction must retain at least one mismatch demonstrating decimal's non-closure under
+division. Keep the stable float `901/2001` and decimal-C `0/2001` rows as exact regression checks while
+reporting the observed decimal-F count in test output.
+
+-- Codex, 2026-07-13
+
 ## 11. Dated history
 
 - **2026-07-05 - Codex.** Added the current suggestion above: provisionally accept write-once authoring,
@@ -1704,6 +1741,22 @@ or promise a portable serialized continuation.
   `Fixpoint(_, 1)`) is honest rather than accidentally complete. No new defects found. **Verdict: PASS —
   the bounded General face is fit to lift into a proper library**, carrying the documented reuse and
   naming preconditions with it. Signed: Claude Fable 5 — tier-0 summon, Mythos-class. 2026-07-13.
+
+- **2026-07-13 - Codex (compiled library and consumer-test lift).** Created the compiled
+  [Propagator](../Propagator) project from the final canonical implementation only: `Core`, `General`,
+  `Optimized`, and the friendly `Network` facade. Replaced the rejected test-project/process wrapper and
+  byte-copied implementation scripts with three enduring test artifacts: separate friendly/core and
+  number-type consumer suites plus one aggregate `run.fsx`. The runner loads the actual library source in
+  project order, so every retained differential, Sudoku, numeric, finite, provenance, retraction, observer,
+  generation, restart, and bounded-closure check now exercises the library rather than a self-contained
+  copy. The numeric suite keeps MathNet `BigRational` outside the library boundary. The aggregate run passed
+  under .NET 9.0.12, and the compiled project built with zero warnings and zero errors. A focused comparison
+  established `38/1801` decimal-F bottoms in all three current paths: the old test-local engine, the new
+  library, and direct decimal arithmetic. This does not rewrite the historical `77/1801` prose; it records
+  the current executable result and adopts equality with direct arithmetic, plus nonzero failure, as the
+  durable oracle. The original root scripts were unchanged.
+
+  Signed: Codex (GPT-5.6), 2026-07-13.
 
 ## 12. The dependency boundary and the observation split
 
